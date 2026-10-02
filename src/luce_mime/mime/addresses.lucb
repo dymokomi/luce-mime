@@ -1,0 +1,185 @@
+#==============================================================================================
+#
+#   mime/addresses - RFC 5322 address lists
+#
+#   DESCRIPTION:
+#       From, To, Cc and their kin hold mailboxes, `Name <local@domain>` or a bare
+#       `local@domain`, separated by commas, possibly inside named groups
+#       (`Team: a@x, b@y;`). The parser is the forgiving kind a reader needs: display
+#       names may be quoted, encoded words or raw UTF-8; an old `addr (Name)` comment
+#       supplies the name when there is no other; routes in angle brackets are dropped;
+#       group names are not kept, their members are.
+#
+#==============================================================================================
+
+## One mailbox: a display name (possibly empty) and an address, both UTF-8.
+pub struct Address:
+    pub var name: str
+    pub var mailbox: str
+
+## A list of addresses whose text is kept in a TextPool.
+pub struct AddressList:
+    var items: Address[]
+    var count: usize
+
+    ## How many addresses there are.
+    pub func length() -> usize:
+        return self.count
+
+    ## The address at `index`.
+    pub func at(index: usize) -> Address!:
+        if index >= self.count:
+            error(out_of_range, "no address at that index")
+        return self.items[index]
+
+    mutating func add(address: Address) -> !:
+        if self.count == self.items.length:
+            let capacity: usize = 8 if self.items.length == 0 else self.items.length * 2
+            let grown = try alloc Address[capacity] in memory.heap
+            for index in 0..<self.count:
+                grown[index] = self.items[index]
+            if self.items.length > 0:
+                free(self.items) in memory.heap
+            self.items = grown
+        self.items[self.count] = address
+        self.count += 1
+
+    ## Give the list back; the text stays in its pool.
+    pub mutating func close():
+        if self.items.length > 0:
+            free(self.items) in memory.heap
+        var empty: Address[]
+        self.items = empty
+        self.count = 0
+
+## The address being read: its phrase, an angle address, an old-style comment.
+struct Pending:
+    var phrase: Bytes
+    var angle: Bytes
+    var comment: Bytes
+    var has_angle: bool
+
+    mutating func clear():
+        self.phrase.clear()
+        self.angle.clear()
+        self.comment.clear()
+        self.has_angle = false
+
+    mutating func close():
+        self.phrase.close()
+        self.angle.close()
+        self.comment.close()
+
+## Append the run of a quoted string starting after its opening quote; the offset after it.
+func read_quoted(data: const u8[], start: usize, out: Bytes*) -> usize!:
+    var index = start
+    while index < data.length:
+        var byte = data[index]
+        if byte == '"':
+            return index + 1
+        if byte == '\\' and index + 1 < data.length:
+            index += 1
+            byte = data[index]
+        if byte != '\r' and byte != '\n':
+            try out.byte(byte)
+        index += 1
+    return index
+
+## Append a comment's text starting after its `(`; the offset after its `)`.
+func read_comment(data: const u8[], start: usize, out: Bytes*) -> usize!:
+    var depth: usize = 1
+    var index = start
+    while index < data.length:
+        var byte = data[index]
+        if byte == '\\' and index + 1 < data.length:
+            index += 1
+            byte = data[index]
+        elif byte == '(':
+            depth += 1
+        elif byte == ')':
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        try out.byte(byte)
+        index += 1
+    return index
+
+## Add the pending address to `list`, if it names one.
+func finish(pending: Pending*, pool: TextPool*, list: AddressList*) -> !:
+    var name: Bytes
+    defer name.close()
+    var mailbox: Bytes
+    defer mailbox.close()
+    if pending.has_angle:
+        var route = trim(pending.angle.view())
+        # `<@relay.example:user@host>`: the route ends at the last colon.
+        var colon: usize? = none
+        for index in 0..<route.length:
+            if route[index] == ':':
+                colon = index
+        if let at = colon:
+            route = route[at + 1..]
+        for byte in route:
+            if not is_space(byte):
+                try mailbox.byte(byte)
+        try header_text(pending.phrase.view(), &name)
+    else:
+        for byte in pending.phrase.view():
+            if not is_space(byte):
+                try mailbox.byte(byte)
+        try header_text(pending.comment.view(), &name)
+    if mailbox.used > 0 or name.used > 0:
+        let mailbox_text = try pool.keep(mailbox.view())
+        let name_text = try pool.keep(name.view())
+        try list.add(Address(name = (str)name_text, mailbox = (str)mailbox_text))
+    pending.clear()
+
+## Read address list `value` into `list`, its text kept in `pool`.
+pub func read_addresses(value: const u8[], pool: TextPool*, list: AddressList*) -> !:
+    var pending: Pending
+    defer pending.close()
+    var index: usize = 0
+    while index < value.length:
+        let byte = value[index]
+        if byte == '"':
+            index = try read_quoted(value, index + 1, &pending.phrase)
+        elif byte == '(':
+            if pending.comment.used > 0:
+                try pending.comment.byte(' ')
+            index = try read_comment(value, index + 1, &pending.comment)
+        elif byte == '<':
+            pending.has_angle = true
+            pending.angle.clear()
+            index += 1
+            while index < value.length and value[index] != '>':
+                try pending.angle.byte(value[index])
+                index += 1
+            index += 1
+        elif byte == ':' and not pending.has_angle:
+            # A group's name: its members follow, the name itself is not an address.
+            pending.clear()
+            index += 1
+        elif byte == ',' or byte == ';':
+            try finish(&pending, pool, list)
+            index += 1
+        else:
+            if is_space(byte):
+                if pending.phrase.used > 0:
+                    try pending.phrase.byte(' ')
+                while index < value.length and is_space(value[index]):
+                    index += 1
+                continue
+            try pending.phrase.byte(byte)
+            index += 1
+    try finish(&pending, pool, list)
+
+## Append `address` as it goes in a header: `name <mailbox>` with the name encoded as
+## needed, or the bare mailbox.
+pub func write_address(name: const u8[], mailbox: const u8[], out: Bytes*) -> !:
+    if trim(name).length == 0:
+        try out.put(mailbox)
+        return
+    try encode_phrase(trim(name), out)
+    try out.put(b" <")
+    try out.put(mailbox)
+    try out.byte('>')

@@ -1,0 +1,203 @@
+#==============================================================================================
+#
+#   mime/words - RFC 2047 encoded words, decoded and written
+#
+#   DESCRIPTION:
+#       Header text outside ASCII travels as encoded words, `=?charset?B|Q?payload?=`.
+#       Reading: each word's bytes are decoded, adjacent words in one charset are joined
+#       before conversion (a sender may split one character across two words), the
+#       whitespace between two words disappears, and raw 8-bit bytes outside words are
+#       UTF-8 (RFC 6532) or else Windows-1252. Readers are lenient about spaces inside a
+#       payload, which some senders write. Writing: text outside ASCII becomes UTF-8 words
+#       of at most 75 characters, Q-encoded when mostly ASCII, B-encoded otherwise, split
+#       only between characters.
+#
+#==============================================================================================
+
+## The longest payload read as one encoded word.
+let maximum_word: usize = 4096
+
+## One encoded word found in header text.
+struct Word:
+    var charset: const u8[]
+    var quoted: bool
+    var payload: const u8[]
+    ## The offset just past its closing `?=`.
+    var end: usize
+
+## The encoded word starting at `start` (at `=?`), or none when it is not one.
+func read_word(data: const u8[], start: usize) -> Word?:
+    if start + 1 >= data.length or data[start] != '=' or data[start + 1] != '?':
+        return none
+    let charset_start = start + 2
+    let charset_end = index_of(data, '?', charset_start) else return none
+    if charset_end == charset_start or charset_end - charset_start > 64 or charset_end + 2 >= data.length:
+        return none
+    let coding = lower(data[charset_end + 1])
+    if (coding != 'b' and coding != 'q') or data[charset_end + 2] != '?':
+        return none
+    let payload_start = charset_end + 3
+    var index = payload_start
+    while index + 1 < data.length:
+        if data[index] == '?' and data[index + 1] == '=':
+            break
+        if data[index] == '\r' or data[index] == '\n' or index - payload_start > maximum_word:
+            return none
+        index += 1
+    if index + 1 >= data.length:
+        return none
+    var charset = data[charset_start..<charset_end]
+    # RFC 2231 §5 lets a word name its language: `charset*lang`.
+    if let star = index_of(charset, '*'):
+        charset = charset[0..<star]
+    return Word(charset = charset, quoted = coding == 'q', payload = data[payload_start..<index], end = index + 2)
+
+## Append text that is outside any encoded word: UTF-8 if it is valid, Windows-1252 if not.
+func put_raw_text(data: const u8[], out: Bytes*) -> !:
+    if utf8.valid(data):
+        try out.put(data)
+    else:
+        try put_single_byte(data, out, false)
+
+## Append header text `data`, already unfolded, with its encoded words decoded.
+pub func decode_words(data: const u8[], out: Bytes*) -> !:
+    var pending: Bytes
+    defer pending.close()
+    var pending_charset: const u8[]
+    var after_word = false
+    var index: usize = 0
+    while index < data.length:
+        if let word = read_word(data, index):
+            if pending.used > 0 and not same(word.charset, pending_charset):
+                try decode_charset(pending_charset, pending.view(), out)
+                pending.clear()
+            pending_charset = word.charset
+            if word.quoted:
+                try decode_quoted(word.payload, &pending, words = true)
+            else:
+                try decode_base64(word.payload, &pending)
+            index = word.end
+            after_word = true
+            continue
+        if after_word:
+            # Whitespace between two encoded words is not part of the text.
+            if is_space(data[index]):
+                var next = index
+                while next < data.length and is_space(data[next]):
+                    next += 1
+                if next < data.length and read_word(data, next) != none:
+                    index = next
+                    continue
+            if pending.used > 0:
+                try decode_charset(pending_charset, pending.view(), out)
+                pending.clear()
+            after_word = false
+        # Plain text runs to the next `=?`, which may begin a word.
+        var end = index + 1
+        while end < data.length and not (data[end] == '=' and end + 1 < data.length and data[end + 1] == '?'):
+            end += 1
+        try put_raw_text(data[index..<end], out)
+        index = end
+    if pending.used > 0:
+        try decode_charset(pending_charset, pending.view(), out)
+
+## The length of the UTF-8 sequence led by `byte`, at least one.
+func sequence_length(byte: u8) -> usize:
+    if byte >= 0xF0:
+        return 4
+    if byte >= 0xE0:
+        return 3
+    if byte >= 0xC0:
+        return 2
+    return 1
+
+## How many characters `byte` takes in a Q payload.
+func q_width(byte: u8) -> usize:
+    if byte == ' ':
+        return 1
+    if (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9'):
+        return 1
+    if byte == '!' or byte == '*' or byte == '+' or byte == '-' or byte == '/':
+        return 1
+    return 3
+
+## Append `text` as UTF-8 encoded words separated by single spaces, each at most 75
+## characters, split only between characters.
+pub func encode_words(text: const u8[], out: Bytes*) -> !:
+    var high: usize = 0
+    for byte in text:
+        if byte >= 0x80:
+            high += 1
+    let quoted = high * 3 < text.length
+    # The payload room in a 75-character word after `=?UTF-8?Q?` and `?=`.
+    let room: usize = 63
+    var start: usize = 0
+    var first = true
+    while start < text.length:
+        var end = start
+        var width: usize = 0
+        while end < text.length:
+            let length = sequence_length(text[end])
+            let stop = end + length if end + length <= text.length else text.length
+            var cost: usize = 0
+            if quoted:
+                for index in end..<stop:
+                    cost += q_width(text[index])
+            else:
+                # Base64 grows every three bytes into four characters.
+                cost = ((stop - start + 2) // 3) * 4 - width
+            if width + cost > room and end > start:
+                break
+            width += cost
+            end = stop
+        if not first:
+            try out.byte(' ')
+        first = false
+        try out.put(b"=?UTF-8?Q?" if quoted else b"=?UTF-8?B?")
+        if quoted:
+            try encode_q(text[start..<end], out)
+        else:
+            try encode_base64(text[start..<end], out, line = 0)
+        try out.put(b"?=")
+        start = end
+
+## Whether `byte` may stand in an RFC 5322 atom.
+pub func is_atext(byte: u8) -> bool:
+    if (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9'):
+        return true
+    return index_of("!#$%&'*+-/=?^_`{|}~".bytes, byte) != none
+
+## Append `text` as an unstructured header value: as it is when it is printable ASCII and
+## holds nothing that reads as an encoded word, as encoded words otherwise.
+pub func encode_text(text: const u8[], out: Bytes*) -> !:
+    var plain = true
+    for index in 0..<text.length:
+        let byte = text[index]
+        if byte >= 0x80 or (byte < 32 and byte != '\t') or byte == 127:
+            plain = false
+        if byte == '=' and index + 1 < text.length and text[index + 1] == '?':
+            plain = false
+    if plain:
+        try out.put(text)
+    else:
+        try encode_words(text, out)
+
+## Append `text` as a display name: atoms as they are, other ASCII as a quoted string,
+## anything else as encoded words.
+pub func encode_phrase(text: const u8[], out: Bytes*) -> !:
+    var atoms = true
+    for byte in text:
+        if byte >= 0x80 or byte < 32 or byte == 127:
+            try encode_words(text, out)
+            return
+        if not is_atext(byte) and byte != ' ':
+            atoms = false
+    if atoms:
+        try out.put(text)
+        return
+    try out.byte('"')
+    for byte in text:
+        if byte == '"' or byte == '\\':
+            try out.byte('\\')
+        try out.byte(byte)
+    try out.byte('"')

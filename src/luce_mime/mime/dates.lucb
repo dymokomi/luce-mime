@@ -1,0 +1,196 @@
+#==============================================================================================
+#
+#   mime/dates - RFC 5322 dates, read and written
+#
+#   DESCRIPTION:
+#       `Fri, 2 Oct 2026 20:34:26 +0000` and the obsolete forms senders still use: no day
+#       of the week, no seconds, two- or three-digit years, zone names (GMT, EST, …),
+#       comments and stray commas. A date is a Unix time and the sender's offset from UTC
+#       in minutes. Dates are written in the strict form, in the offset given.
+#
+#==============================================================================================
+
+## A moment and the zone it was written in.
+pub struct Date:
+    ## Seconds since 1970-01-01 00:00:00 UTC.
+    pub var seconds: i64
+    ## The writer's offset from UTC in minutes, east positive.
+    pub var offset: i64
+
+let month_names: str[12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+let day_names: str[7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+let month_titles: str[12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+## Days from 1970-01-01 to the civil date (proleptic Gregorian).
+pub func days_from_civil(year: i64, month: i64, day: i64) -> i64:
+    let y = year - 1 if month <= 2 else year
+    let era = (y if y >= 0 else y - 399) // 400
+    let year_of_era = y - era * 400
+    let day_of_year = (153 * (month - 3 if month > 2 else month + 9) + 2) // 5 + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+
+## The civil date of a day count from 1970-01-01: year, month, day.
+pub func civil_from_days(days: i64) -> (i64, i64, i64):
+    let z = days + 719468
+    let era = (z if z >= 0 else z - 146096) // 146097
+    let day_of_era = z - era * 146097
+    let year_of_era = (day_of_era - day_of_era // 1460 + day_of_era // 36524 - day_of_era // 146096) // 365
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era // 4 - year_of_era // 100)
+    let shifted = (5 * day_of_year + 2) // 153
+    let day = day_of_year - (153 * shifted + 2) // 5 + 1
+    let month = shifted + 3 if shifted < 10 else shifted - 9
+    let year = year_of_era + era * 400 + (1 if month <= 2 else 0)
+    return (year, month, day)
+
+## The offset in minutes of a zone name, or none for one this reader does not know.
+func zone_name(word: const u8[]) -> i64?:
+    if same(word, b"ut") or same(word, b"utc") or same(word, b"gmt") or same(word, b"z"):
+        return 0
+    if same(word, b"edt"):
+        return -240
+    if same(word, b"est") or same(word, b"cdt"):
+        return -300
+    if same(word, b"cst") or same(word, b"mdt"):
+        return -360
+    if same(word, b"mst") or same(word, b"pdt"):
+        return -420
+    if same(word, b"pst"):
+        return -480
+    return none
+
+## Read the date in header value `value`, or none when it holds no usable date.
+pub func read_date(value: const u8[]) -> Date?:
+    var day: i64? = none
+    var month: i64? = none
+    var year: i64? = none
+    var hour: i64 = 0
+    var minute: i64 = 0
+    var second: i64 = 0
+    var offset: i64 = 0
+    var index: usize = 0
+    while index < value.length:
+        let byte = value[index]
+        if byte == '(':
+            var depth: usize = 0
+            while index < value.length:
+                if value[index] == '(':
+                    depth += 1
+                elif value[index] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            index += 1
+        elif byte >= '0' and byte <= '9':
+            var number: i64 = 0
+            let start = index
+            while index < value.length and value[index] >= '0' and value[index] <= '9' and index - start < 9:
+                number = number * 10 + (i64)(value[index] - '0')
+                index += 1
+            let digits = index - start
+            if index < value.length and value[index] == ':':
+                hour = number
+                index += 1
+                var parts: u32 = 0
+                while parts < 2:
+                    var field: i64 = 0
+                    let field_start = index
+                    while index < value.length and value[index] >= '0' and value[index] <= '9' and index - field_start < 2:
+                        field = field * 10 + (i64)(value[index] - '0')
+                        index += 1
+                    if parts == 0:
+                        minute = field
+                    else:
+                        second = field
+                    parts += 1
+                    if index < value.length and value[index] == ':':
+                        index += 1
+                    else:
+                        break
+            elif day == none and digits <= 2:
+                day = number
+            elif year == none:
+                year = number
+                if digits <= 2:
+                    year = number + (2000 if number < 50 else 1900)
+                elif digits == 3:
+                    year = number + 1900
+        elif (byte == '+' or byte == '-') and index + 4 < value.length:
+            var zone: i64 = 0
+            var valid = true
+            for at in index + 1..<index + 5:
+                if value[at] < '0' or value[at] > '9':
+                    valid = false
+                    break
+                zone = zone * 10 + (i64)(value[at] - '0')
+            if valid:
+                offset = (zone // 100) * 60 + zone % 100
+                if byte == '-':
+                    offset = -offset
+                index += 5
+            else:
+                index += 1
+        elif (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z'):
+            let start = index
+            while index < value.length and ((value[index] >= 'a' and value[index] <= 'z') or (value[index] >= 'A' and value[index] <= 'Z')):
+                index += 1
+            let word = value[start..<index]
+            if word.length >= 3:
+                for at: usize in 0..<12:
+                    if same(word[0..<3], month_names[at].bytes) and month == none:
+                        month = (i64)at + 1
+            if let zone = zone_name(word):
+                offset = zone
+        else:
+            index += 1
+    let d = day else return none
+    let m = month else return none
+    let y = year else return none
+    if d < 1 or d > 31 or y < 1000 or y > 9999 or hour > 23 or minute > 59 or second > 60:
+        return none
+    let wall = days_from_civil(y, m, d) * 86400 + hour * 3600 + minute * 60 + second
+    return Date(seconds = wall - offset * 60, offset = offset)
+
+## Append `value` in decimal with at least `width` digits.
+func put_number(value: i64, width: usize, out: Bytes*) -> !:
+    var digits: u8[20]
+    var count: usize = 0
+    var rest = value if value >= 0 else -value
+    while rest > 0 or count < width:
+        digits[count] = (u8)(rest % 10) + '0'
+        rest = rest // 10
+        count += 1
+    if value < 0:
+        try out.byte('-')
+    while count > 0:
+        count -= 1
+        try out.byte(digits[count])
+
+## Append `date` in RFC 5322 form, `Fri, 02 Oct 2026 20:34:26 +0000`, in its own offset.
+pub func write_date(date: Date, out: Bytes*) -> !:
+    let wall = date.seconds + date.offset * 60
+    var days = wall // 86400
+    var rest = wall % 86400
+    if rest < 0:
+        rest += 86400
+        days -= 1
+    let (year, month, day) = civil_from_days(days)
+    let weekday = ((days % 7) + 11) % 7
+    try out.text(day_names[(usize)weekday])
+    try out.put(b", ")
+    try put_number(day, 2, out)
+    try out.byte(' ')
+    try out.text(month_titles[(usize)(month - 1)])
+    try out.byte(' ')
+    try put_number(year, 4, out)
+    try out.byte(' ')
+    try put_number(rest // 3600, 2, out)
+    try out.byte(':')
+    try put_number((rest // 60) % 60, 2, out)
+    try out.byte(':')
+    try put_number(rest % 60, 2, out)
+    try out.byte(' ')
+    try out.byte('-' if date.offset < 0 else '+')
+    let zone = date.offset if date.offset >= 0 else -date.offset
+    try put_number((zone // 60) * 100 + zone % 60, 4, out)

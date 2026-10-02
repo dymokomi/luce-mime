@@ -1,0 +1,203 @@
+#==============================================================================================
+#
+#   mime/parts - The MIME part tree
+#
+#   DESCRIPTION:
+#       A message is a tree of entities: a header and a body each. A multipart body is
+#       split at its boundary lines into child entities (RFC 2046 §5.1); a message/rfc822
+#       body is itself a message, read as one child. Parts are kept flat, in document
+#       order, each naming its parent, so part 0 is the message itself. Bodies stay
+#       encoded in the message's bytes; `decode_body` and `decode_text` decode on request.
+#       Malformed input degrades rather than fails: a multipart without a boundary, or
+#       one never closed, keeps what it has; past the depth or part limits the rest of a
+#       body is one opaque part.
+#
+#==============================================================================================
+
+## One entity of the tree: its header, where its body lies, and its media type.
+pub struct Part:
+    ## The index of the enclosing part; -1 for the message itself.
+    pub var parent: i64
+    ## How many parts enclose this one.
+    pub var depth: u32
+    pub var header: Header
+    ## Where the body lies in the message's bytes.
+    pub var body_start: usize
+    pub var body_end: usize
+    ## The type and subtype as written, `text` and `plain`.
+    pub var kind: const u8[]
+    pub var subtype: const u8[]
+
+    ## Whether the type is `kind`/`subtype`, ignoring case; an empty subtype matches any.
+    pub func is(kind: str, subtype: str = "") -> bool:
+        return same(self.kind, kind.bytes) and (subtype.length == 0 or same(self.subtype, subtype.bytes))
+
+## Every part of a message, in document order.
+pub struct PartList:
+    var items: Part[]
+    var count: usize
+
+    ## How many parts there are.
+    pub func length() -> usize:
+        return self.count
+
+    ## The part at `index`, borrowed until the list closes.
+    pub func at(index: usize) -> const Part*!:
+        if index >= self.count:
+            error(out_of_range, "no part at that index")
+        return &self.items[index]
+
+    mutating func add(part: Part) -> !:
+        if self.count == self.items.length:
+            let capacity: usize = 8 if self.items.length == 0 else self.items.length * 2
+            let grown = try alloc Part[capacity] in memory.heap
+            for index in 0..<self.count:
+                grown[index] = self.items[index]
+            if self.items.length > 0:
+                free(self.items) in memory.heap
+            self.items = grown
+        self.items[self.count] = part
+        self.count += 1
+
+    ## Give every part's header and the list back.
+    pub mutating func close():
+        for index in 0..<self.count:
+            self.items[index].header.close()
+        if self.items.length > 0:
+            free(self.items) in memory.heap
+        var empty: Part[]
+        self.items = empty
+        self.count = 0
+
+## The offset where the line holding `start` ends: its `\n`, or `end`.
+func line_stop(data: const u8[], start: usize, end: usize) -> usize:
+    var index = start
+    while index < end and data[index] != '\n':
+        index += 1
+    return index
+
+## Read the entity in `data[start..<end]` and everything inside it onto `parts`.
+## `digest` says the entity is a child of multipart/digest, whose default type is
+## message/rfc822.
+pub func read_entity(data: const u8[], start: usize, end: usize, parent: i64, depth: u32, digest: bool, parts: PartList*) -> !:
+    var header = try Header.read(data[start..<end])
+    # The header belongs to the part list once added; until then, to this function.
+    var owned = true
+    errdefer:
+        if owned:
+            header.close()
+    var kind = b"text"
+    var subtype = b"plain"
+    if digest:
+        kind = b"message"
+        subtype = b"rfc822"
+    let content_type = header.find("Content-Type")
+    if let value = content_type:
+        let (written_kind, written_subtype) = media_type(value)
+        if written_kind.length > 0 and written_subtype.length > 0:
+            kind = written_kind
+            subtype = written_subtype
+    let index = parts.count
+    let body_start = start + header.body
+    try parts.add(Part(parent = parent, depth = depth, header = header, body_start = body_start,
+                       body_end = end, kind = kind, subtype = subtype))
+    owned = false
+    if depth + 1 >= maximum_depth or parts.count >= maximum_parts:
+        return
+    if same(kind, b"multipart"):
+        var boundary: Bytes
+        defer boundary.close()
+        if let value = content_type:
+            discard(try parameter(value, "boundary", &boundary))
+        if boundary.used > 0 and boundary.used <= 200:
+            try read_multipart(data, body_start, end, boundary.view(), (i64)index, depth + 1, same(subtype, b"digest"), parts)
+        return
+    if same(kind, b"message") and (same(subtype, b"rfc822") or same(subtype, b"global")):
+        # A forwarded message: read it as a child unless it was itself encoded.
+        if let encoding = header.find("Content-Transfer-Encoding"):
+            let name = trim(encoding)
+            if same(name, b"base64") or same(name, b"quoted-printable"):
+                return
+        try read_entity(data, body_start, end, (i64)index, depth + 1, false, parts)
+
+## Read the parts of the multipart body `data[start..<end]` separated by `boundary`.
+func read_multipart(data: const u8[], start: usize, end: usize, boundary: const u8[], parent: i64, depth: u32, digest: bool, parts: PartList*) -> !:
+    var current: usize? = none
+    var line = start
+    while line < end:
+        let stop = line_stop(data, line, end)
+        var content_end = stop
+        if content_end > line and data[content_end - 1] == '\r':
+            content_end -= 1
+        let content = data[line..<content_end]
+        var delimiter = false
+        var closing = false
+        if content.length >= boundary.length + 2 and content[0] == '-' and content[1] == '-' and equal(content[2..<2 + boundary.length], boundary):
+            var rest = content[2 + boundary.length..]
+            if rest.length >= 2 and rest[0] == '-' and rest[1] == '-':
+                closing = true
+                rest = rest[2..]
+            delimiter = trim(rest).length == 0
+        if delimiter:
+            if let opened = current:
+                # The line break before a delimiter belongs to the delimiter.
+                var part_end = line
+                if part_end > opened and data[part_end - 1] == '\n':
+                    part_end -= 1
+                    if part_end > opened and data[part_end - 1] == '\r':
+                        part_end -= 1
+                try read_entity(data, opened, part_end, parent, depth, digest, parts)
+                if parts.count >= maximum_parts:
+                    return
+            if closing:
+                return
+            current = stop + 1 if stop < end else end
+        line = stop + 1
+    if let opened = current:
+        if opened < end:
+            try read_entity(data, opened, end, parent, depth, digest, parts)
+
+## The transfer encoding of `part`, as written; empty for none.
+func transfer_encoding(part: const Part*) -> const u8[]:
+    if let value = part.header.find("Content-Transfer-Encoding"):
+        return leading_token(value)
+    var empty: const u8[]
+    return empty
+
+## Append the body of `part` in `data`, with its transfer encoding undone.
+pub func decode_body(data: const u8[], part: const Part*, out: Bytes*) -> !:
+    let body = data[part.body_start..<part.body_end]
+    let encoding = transfer_encoding(part)
+    if same(encoding, b"base64"):
+        try decode_base64(body, out)
+    elif same(encoding, b"quoted-printable"):
+        try decode_quoted(body, out)
+    else:
+        try out.put(body)
+
+## Append the body of text part `part` as UTF-8: decoded, then converted from its charset.
+pub func decode_text(data: const u8[], part: const Part*, out: Bytes*) -> !:
+    var decoded: Bytes
+    defer decoded.close()
+    try decode_body(data, part, &decoded)
+    var charset: Bytes
+    defer charset.close()
+    if let value = part.header.find("Content-Type"):
+        discard(try parameter(value, "charset", &charset))
+    try decode_charset(charset.view(), decoded.view(), out)
+
+## The disposition of `part` as written (`inline`, `attachment`), or empty.
+pub func disposition(part: const Part*) -> const u8[]:
+    if let value = part.header.find("Content-Disposition"):
+        return leading_token(value)
+    var empty: const u8[]
+    return empty
+
+## Append `part`'s file name: the disposition's `filename`, else the type's `name`.
+pub func file_name(part: const Part*, out: Bytes*) -> bool!:
+    if let value = part.header.find("Content-Disposition"):
+        if try parameter(value, "filename", out):
+            return true
+    if let value = part.header.find("Content-Type"):
+        return try parameter(value, "name", out)
+    return false

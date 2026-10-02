@@ -1,0 +1,150 @@
+#==============================================================================================
+#
+#   mime/codecs - Base64 and quoted-printable, both ways
+#
+#   DESCRIPTION:
+#       Decoding is forgiving, as mail readers have to be: base64 skips whitespace and
+#       anything outside its alphabet and stops at padding; quoted-printable keeps an `=`
+#       that does not start a valid escape. Encoding is strict: base64 in 76-column lines,
+#       quoted-printable after RFC 2045 §6.7 with CRLF line ends, and the Q form of RFC 2047
+#       for encoded words.
+#
+#==============================================================================================
+
+let alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+## The six-bit value of base64 character `byte`, or none.
+func sextet(byte: u8) -> u8?:
+    if byte >= 'A' and byte <= 'Z':
+        return byte - 'A'
+    if byte >= 'a' and byte <= 'z':
+        return byte - 'a' + 26
+    if byte >= '0' and byte <= '9':
+        return byte - '0' + 52
+    if byte == '+' or byte == '-':
+        return 62
+    if byte == '/' or byte == '_':
+        return 63
+    return none
+
+## Decode base64 `data` (standard or URL alphabet) onto `out`.
+pub func decode_base64(data: const u8[], out: Bytes*) -> !:
+    var group: u32 = 0
+    var held: u32 = 0
+    for byte in data:
+        if byte == '=':
+            break
+        let value = sextet(byte) else continue
+        group = (group << 6) | value
+        held += 1
+        if held == 4:
+            try out.byte((u8)(group >> 16))
+            try out.byte((u8)(group >> 8))
+            try out.byte((u8)group)
+            group = 0
+            held = 0
+    if held == 2:
+        try out.byte((u8)(group >> 4))
+    elif held == 3:
+        try out.byte((u8)(group >> 10))
+        try out.byte((u8)(group >> 2))
+
+## Encode `data` as base64 onto `out`; `line` > 0 breaks lines of that many characters
+## with CRLF, the last line included.
+pub func encode_base64(data: const u8[], out: Bytes*, line: usize = 76) -> !:
+    let letters = alphabet.bytes
+    var column: usize = 0
+    var index: usize = 0
+    while index < data.length:
+        let remaining = data.length - index
+        var group: u32 = (u32)data[index] << 16
+        if remaining > 1:
+            group |= (u32)data[index + 1] << 8
+        if remaining > 2:
+            group |= data[index + 2]
+        try out.byte(letters[(group >> 18) & 63])
+        try out.byte(letters[(group >> 12) & 63])
+        try out.byte(letters[(group >> 6) & 63] if remaining > 1 else '=')
+        try out.byte(letters[group & 63] if remaining > 2 else '=')
+        index += 3 if remaining >= 3 else remaining
+        column += 4
+        if line > 0 and column >= line:
+            try out.put(b"\r\n")
+            column = 0
+    if line > 0 and column > 0:
+        try out.put(b"\r\n")
+
+## Decode quoted-printable `data` onto `out`. With `words`, `_` is a space (RFC 2047 Q).
+pub func decode_quoted(data: const u8[], out: Bytes*, words: bool = false) -> !:
+    var index: usize = 0
+    while index < data.length:
+        let byte = data[index]
+        if byte == '_' and words:
+            try out.byte(' ')
+            index += 1
+            continue
+        if byte != '=':
+            try out.byte(byte)
+            index += 1
+            continue
+        # A soft line break: `=` before the line end, perhaps after trailing blanks.
+        var after = index + 1
+        while after < data.length and (data[after] == ' ' or data[after] == '\t'):
+            after += 1
+        if after < data.length and (data[after] == '\r' or data[after] == '\n'):
+            if data[after] == '\r' and after + 1 < data.length and data[after + 1] == '\n':
+                after += 1
+            index = after + 1
+            continue
+        if after == data.length:
+            index = after
+            continue
+        if index + 2 < data.length:
+            if let high = hex_value(data[index + 1]):
+                if let low = hex_value(data[index + 2]):
+                    try out.byte((high << 4) | low)
+                    index += 3
+                    continue
+        try out.byte('=')
+        index += 1
+
+## Encode `data` as quoted-printable body text onto `out`: lines end in CRLF, lines stay
+## within 76 characters with soft breaks, and trailing blanks are escaped.
+pub func encode_quoted(data: const u8[], out: Bytes*) -> !:
+    var column: usize = 0
+    var index: usize = 0
+    while index < data.length:
+        let byte = data[index]
+        if byte == '\n' or (byte == '\r' and index + 1 < data.length and data[index + 1] == '\n'):
+            try out.put(b"\r\n")
+            column = 0
+            index += 1 if byte == '\n' else 2
+            continue
+        let at_line_end = index + 1 == data.length or data[index + 1] == '\r' or data[index + 1] == '\n'
+        let blank = byte == ' ' or byte == '\t'
+        let plain = (byte >= 33 and byte <= 126 and byte != '=') or (blank and not at_line_end)
+        let width: usize = 1 if plain else 3
+        if column + width > 75:
+            try out.put(b"=\r\n")
+            column = 0
+        if plain:
+            try out.byte(byte)
+        else:
+            try out.byte('=')
+            try out.byte(hex_digit(byte >> 4))
+            try out.byte(hex_digit(byte & 15))
+        column += width
+        index += 1
+
+## Encode `data` in RFC 2047's Q form onto `out`: what may stand in a phrase is literal,
+## a space is `_`, the rest is `=XX`.
+pub func encode_q(data: const u8[], out: Bytes*) -> !:
+    for byte in data:
+        if byte == ' ':
+            try out.byte('_')
+        elif (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9') or byte == '!' or byte == '*' or byte == '+' or byte == '-' or byte == '/':
+            try out.byte(byte)
+        else:
+            try out.byte('=')
+            try out.byte(hex_digit(byte >> 4))
+            try out.byte(hex_digit(byte & 15))

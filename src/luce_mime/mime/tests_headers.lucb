@@ -1,0 +1,106 @@
+#==============================================================================================
+#
+#   mime/tests_headers - Encoded words, header blocks, structured values and charsets
+#
+#==============================================================================================
+
+## The header text of `value`, written to `out`.
+func text_of(value: str, out: Bytes*) -> str!:
+    out.clear()
+    try header_text(value.bytes, out)
+    return (str)out.view()
+
+test "encoded words decode, join across words and drop the space between them":
+    var out: Bytes
+    defer out.close()
+    assert(try text_of("=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>", &out) == "André Pirard <PIRARD@vm1.ulg.ac.be>")
+    assert(try text_of("=?UTF-8?B?SGVsbG8g?= =?UTF-8?B?d29ybGQ=?=", &out) == "Hello world")
+    # One character split across two words: the bytes join before conversion.
+    assert(try text_of("=?UTF-8?Q?Caf=C3?= =?UTF-8?Q?=A9?=", &out) == "Café")
+    assert(try text_of("(=?ISO-8859-1?Q?a?= b)", &out) == "(a b)")
+    assert(try text_of("=?utf-8*en?q?hi_there?=", &out) == "hi there")
+    assert(try text_of("plain =?bogus text", &out) == "plain =?bogus text")
+    assert(try text_of("Re:\r\n =?windows-1252?Q?=93quoted=94?=", &out) == "Re: “quoted”")
+
+test "raw 8-bit header text is UTF-8 when valid and Windows-1252 otherwise":
+    var out: Bytes
+    defer out.close()
+    try header_text(b"Caf\xC3\xA9", &out)
+    assert((str)out.view() == "Café")
+    out.clear()
+    try header_text(b"Caf\xE9", &out)
+    assert((str)out.view() == "Café")
+
+test "a header block unfolds, finds fields without case and marks its body":
+    let data = b"From mbox-line\r\nSubject: Hello\r\n there\r\nX-Empty:\r\nto: a@b.c\r\n\r\nBody text\r\n"
+    var header = try Header.read(data)
+    defer header.close()
+    assert(header.length() == 3)
+    var out: Bytes
+    defer out.close()
+    try header_text(header.find("SUBJECT") else trap("no subject"), &out)
+    assert((str)out.view() == "Hello there")
+    assert((str)(header.find("To") else trap("no to")) == "a@b.c")
+    assert((str)data[header.body..] == "Body text\r\n")
+    let empty = try Header.read(b"Subject: x\nno-colon line\n\nbody")
+    assert(empty.length() == 1)
+    assert(empty.body == 26)
+
+test "content types, dispositions and RFC 2231 parameters":
+    let (kind, subtype) = media_type(b"Multipart/Mixed (comment); boundary=\"==b; 1==\"")
+    assert((str)kind == "Multipart" and (str)subtype == "Mixed")
+    var out: Bytes
+    defer out.close()
+    assert(try parameter(b"multipart/mixed; boundary=\"==b; 1==\"", "boundary", &out))
+    assert((str)out.view() == "==b; 1==")
+    out.clear()
+    assert(try parameter(b"text/plain; charset=us-ascii (Plain text)", "CHARSET", &out))
+    assert((str)out.view() == "us-ascii")
+    out.clear()
+    assert(not try parameter(b"text/plain", "charset", &out))
+    assert(try parameter(b"application/x-stuff; title*1*=%2A%2A%2Afun%2A%2A%2A%20; title*2=\"isn't it!\"; title*0*=us-ascii'en'This%20is%20even%20more%20", "title", &out))
+    assert((str)out.view() == "This is even more ***fun*** isn't it!")
+    out.clear()
+    assert(try parameter(b"attachment; filename*=UTF-8''na%C3%AFve%20r%C3%A9sum%C3%A9.pdf", "filename", &out))
+    assert((str)out.view() == "naïve résumé.pdf")
+    out.clear()
+    assert(try parameter(b"attachment; filename=\"=?utf-8?B?0KTQsNC50Lsu0YLRhdGC?=\"", "filename", &out))
+    assert((str)out.view() == "Файл.тхт")
+    assert((str)leading_token(b" Attachment ; filename=a") == "Attachment")
+
+test "encoding header text and phrases":
+    var out: Bytes
+    defer out.close()
+    try encode_text(b"Plain subject", &out)
+    assert((str)out.view() == "Plain subject")
+    out.clear()
+    try encode_text("Café au lait".bytes, &out)
+    assert((str)out.view() == "=?UTF-8?Q?Caf=C3=A9_au_lait?=")
+    var back: Bytes
+    defer back.close()
+    try decode_words(out.view(), &back)
+    assert((str)back.view() == "Café au lait")
+    out.clear()
+    try encode_phrase(b"Doe, John", &out)
+    assert((str)out.view() == "\"Doe, John\"")
+    out.clear()
+    try encode_phrase("Жанна Д'Арк".bytes, &out)
+    back.clear()
+    try decode_words(out.view(), &back)
+    assert((str)back.view() == "Жанна Д'Арк")
+    # A long value becomes several words of at most 75 characters each.
+    out.clear()
+    try encode_text("Привет мир, это длинная тема письма, которая не помещается в одно слово".bytes, &out)
+    var words: usize = 1
+    var length: usize = 0
+    for byte in out.view():
+        if byte == ' ':
+            assert(length <= 75)
+            words += 1
+            length = 0
+        else:
+            length += 1
+    assert(words > 1 and length <= 75)
+    back.clear()
+    try decode_words(out.view(), &back)
+    assert((str)back.view() == "Привет мир, это длинная тема письма, которая не помещается в одно слово")

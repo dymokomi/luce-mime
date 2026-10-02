@@ -1,0 +1,174 @@
+#==============================================================================================
+#
+#   mime/tests_message - Addresses, dates, the part tree, HTML as text, and Message
+#
+#==============================================================================================
+
+## A multipart/mixed message: an alternative (plain and HTML) and a base64 attachment.
+let mixed_message: str = """
+    Return-Path: <carol@example.org>
+    From: =?UTF-8?Q?Carol_=C3=85berg?= <carol@example.org>
+    To: Alice <alice@example.test>, "Doe, John" <john@example.test>
+    Cc: Team: bob@example.test, dave@example.test (Dave Ng);, <@relay.example:eve@example.test>
+    Subject: =?UTF-8?B?UXVhcnRlcmx5IHBsYW4g4oCUIGRyYWZ0?=
+    Date: Thu, 1 Oct 2026 09:15:00 -0700 (PDT)
+    Message-ID: <plan.42@example.org>
+    In-Reply-To: <earlier.7@example.test>
+    References: <start.1@example.test>
+     <earlier.7@example.test>
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary="outer"
+
+    This is the preamble.
+    --outer
+    Content-Type: multipart/alternative; boundary=inner
+
+    --inner
+    Content-Type: text/plain; charset=iso-8859-1
+    Content-Transfer-Encoding: quoted-printable
+
+    Hi Alice,
+
+    The plan is attached. Caf=E9 at ten?
+    > earlier quoted text
+    --inner
+    Content-Type: text/html; charset=utf-8
+
+    <html><head><style>p{}</style></head><body><p>Hi Alice,</p><p>The plan is attached.</p></body></html>
+    --inner--
+    --outer
+    Content-Type: application/pdf; name="plan.pdf"
+    Content-Disposition: attachment; filename="plan.pdf"
+    Content-Transfer-Encoding: base64
+
+    JVBERi0xLjQK
+    --outer--
+    The epilogue.
+    """
+
+test "address lists with names, quotes, groups, comments and routes":
+    var pool: TextPool
+    defer pool.close()
+    var list: AddressList
+    defer list.close()
+    try read_addresses(b"Alice <alice@example.test>, \"Doe, John\" <john@example.test>", &pool, &list)
+    try read_addresses(b"Team: bob@example.test, dave@example.test (Dave Ng);, <@relay.example:eve@example.test>", &pool, &list)
+    try read_addresses(b"undisclosed-recipients:;", &pool, &list)
+    try read_addresses(b"=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?= <keld@dkuug.dk>", &pool, &list)
+    assert(list.length() == 6)
+    assert((try list.at(0)).name == "Alice" and (try list.at(0)).mailbox == "alice@example.test")
+    assert((try list.at(1)).name == "Doe, John")
+    assert((try list.at(2)).name == "" and (try list.at(2)).mailbox == "bob@example.test")
+    assert((try list.at(3)).name == "Dave Ng" and (try list.at(3)).mailbox == "dave@example.test")
+    assert((try list.at(4)).mailbox == "eve@example.test")
+    assert((try list.at(5)).name == "Keld Jørn Simonsen")
+    var written: Bytes
+    defer written.close()
+    try write_address(b"Doe, John", b"john@example.test", &written)
+    assert((str)written.view() == "\"Doe, John\" <john@example.test>")
+
+test "dates in the strict and obsolete forms, and written back":
+    let strict = read_date(b"Fri, 2 Oct 2026 20:34:26 +0000") else trap("strict")
+    assert(strict.seconds == 1790973266 and strict.offset == 0)
+    let zoned = read_date(b"Thu, 1 Oct 2026 09:15:00 -0700 (PDT)") else trap("zoned")
+    assert(zoned.seconds == 1790871300 and zoned.offset == -420)
+    let named = read_date(b"1 Oct 26 16:15 GMT") else trap("named")
+    assert(named.seconds == 1790871300)
+    let asctime = read_date(b"Thu Oct  1 16:15:00 2026") else trap("asctime")
+    assert(asctime.seconds == 1790871300)
+    assert(read_date(b"no date here") == none)
+    var out: Bytes
+    defer out.close()
+    try write_date(zoned, &out)
+    assert((str)out.view() == "Thu, 01 Oct 2026 09:15:00 -0700")
+    out.clear()
+    try write_date(Date(seconds = 0, offset = 330), &out)
+    assert((str)out.view() == "Thu, 01 Jan 1970 05:30:00 +0530")
+    let (year, month, day) = civil_from_days(days_from_civil(2000, 2, 29))
+    assert(year == 2000 and month == 2 and day == 29)
+
+test "the part tree of a multipart message":
+    var message = try Message.read(mixed_message.bytes)
+    defer message.close()
+    assert(message.part_count() == 5)
+    assert(try message.part_type(0) == "multipart/mixed")
+    assert(try message.part_type(1) == "multipart/alternative")
+    assert(try message.part_type(2) == "text/plain")
+    assert(try message.part_type(3) == "text/html")
+    assert(try message.part_type(4) == "application/pdf")
+    assert(try message.part_parent(2) == 1 and try message.part_parent(4) == 0)
+    assert(try message.part_depth(3) == 2)
+    assert(try message.part_text(2) == "Hi Alice,\n\nThe plan is attached. Café at ten?\n> earlier quoted text")
+    assert(try message.attachment_count() == 1)
+    let pdf = try message.attachment(0)
+    assert(pdf == 4)
+    assert(try message.part_filename(pdf) == "plan.pdf")
+    assert((str)(try message.part_data(pdf)) == "%PDF-1.4\n")
+    assert(try message.part_charset(2) == "iso-8859-1")
+
+test "header accessors of a message":
+    var message = try Message.read(mixed_message.bytes)
+    defer message.close()
+    assert(try message.subject() == "Quarterly plan — draft")
+    assert(try message.message_id() == "plan.42@example.org")
+    assert(try message.in_reply_to() == "earlier.7@example.test")
+    assert(try message.references() == "<start.1@example.test> <earlier.7@example.test>")
+    assert(message.date_seconds() == 1790871300 and message.date_offset() == -420)
+    assert(try message.address_line("From") == "Carol Åberg <carol@example.org>")
+    assert(try message.address_line("From", short = true) == "Carol Åberg")
+    assert(try message.address_count("To") == 2)
+    assert(try message.address_mailbox("To", 1) == "john@example.test")
+    assert(try message.address_count("Cc") == 3)
+    assert((try message.header("X-Missing")) == none)
+    assert(message.field_count() == 11)
+    assert(try message.field_name(0) == "Return-Path")
+
+test "the body a reader shows and the list preview":
+    var message = try Message.read(mixed_message.bytes)
+    defer message.close()
+    assert(try message.body_text() == "Hi Alice,\n\nThe plan is attached. Café at ten?\n> earlier quoted text")
+    assert(try message.preview() == "Hi Alice, The plan is attached. Café at ten?")
+    assert(try message.preview(limit = 8) == "Hi Alice")
+    assert(strings.starts_with(try message.body_html(), "<html>"))
+
+test "an HTML-only message reads as text":
+    let html = """
+        Content-Type: text/html; charset=utf-8
+
+        <!DOCTYPE html><html><head><title>T</title><script>var x = "<p>";</script></head>
+        <body><h1>Welcome &amp; hello</h1><p>First   paragraph<br>second line</p>
+        <ul><li>one</li><li>two</li></ul><ol><li>first</li><li>second</li></ol>
+        <blockquote>quoted<br>text</blockquote><p>caf&eacute; &#233; &#x2014; &nbsp;<img src="x" alt="logo"></p>
+        <!-- a comment --><table><tr><td>a</td><td>b</td></tr></table><pre>  keep
+          spacing</pre>&bogus; a < b</body></html>
+        """
+    var message = try Message.read(html.bytes)
+    defer message.close()
+    let text = try message.body_text()
+    let expected = "Welcome & hello\n\nFirst paragraph\nsecond line\n\n• one\n• two\n\n1. first\n2. second\n\n> quoted\n> text\n\ncafé é — \u{A0} [logo]\n\na  b\n\n  keep\n  spacing\n\n&bogus; a < b"
+    if text != expected:
+        print(text)
+    assert(text == expected)
+
+test "a single-part message without MIME headers, and junk input":
+    var plain = try Message.read(b"Subject: hi\r\n\r\nJust text.\r\n")
+    defer plain.close()
+    assert(plain.part_count() == 1 and try plain.part_type(0) == "text/plain")
+    assert(try plain.body_text() == "Just text.")
+    assert(try plain.attachment_count() == 0)
+    var junk = try Message.read(b"\x00\xff\xfe garbage without a colon")
+    defer junk.close()
+    assert(junk.field_count() == 0)
+    assert(try junk.body_text() == "")
+    var empty = try Message.read(b"")
+    defer empty.close()
+    assert(empty.part_count() == 1)
+
+test "a multipart with no closing delimiter keeps its parts":
+    let unclosed = "Content-Type: multipart/mixed; boundary=b\n\n--b\n\nfirst\n--b\nContent-Type: image/png\nContent-Transfer-Encoding: base64\n\niVBORw0K"
+    var message = try Message.read(unclosed.bytes)
+    defer message.close()
+    assert(message.part_count() == 3)
+    assert(try message.part_text(1) == "first")
+    assert(try message.part_is_attachment(2))
+    assert(equal(try message.part_data(2), b"\x89PNG\r\n"))

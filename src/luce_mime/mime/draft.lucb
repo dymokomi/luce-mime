@@ -1,0 +1,392 @@
+#==============================================================================================
+#
+#   mime/draft - An outgoing message, written for SMTP
+#
+#   DESCRIPTION:
+#       A Draft collects what a composer has: sender, recipients, subject, a plain-text
+#       body, the thread it replies to, attachments. `encode` writes the message in 7-bit
+#       form with CRLF line ends, ready for SMTP DATA or IMAP APPEND: header text outside
+#       ASCII in encoded words, folded under 78 columns where it can be; the body as
+#       7bit when it is short-lined ASCII and quoted-printable otherwise; attachments in
+#       base64 inside multipart/mixed. Bcc recipients are never written, only listed by
+#       `recipient` for the envelope. A missing Date is now, in UTC; a missing
+#       Message-ID is made from the clock and the sender's domain.
+#
+#==============================================================================================
+
+## Where a recipient goes.
+enum Role as u8:
+    to = 0
+    cc = 1
+    bcc = 2
+
+## A recipient, its text held in the draft's store.
+struct Recipient:
+    var role: Role
+    var name: const u8[]
+    var mailbox: const u8[]
+
+## A file to attach, its bytes held in the draft's store.
+struct Attachment:
+    var name: const u8[]
+    var media_type: const u8[]
+    var data: const u8[]
+
+## An outgoing message.
+pub struct Draft:
+    ## Text and data at stable addresses: names, mailboxes, attachment bytes.
+    var store: TextPool
+    var from_name: const u8[]
+    var from_mailbox: const u8[]
+    var recipients: Recipient[]
+    var recipient_total: usize
+    var subject: const u8[]
+    var body: const u8[]
+    var in_reply_to: const u8[]
+    var references: const u8[]
+    var message_id: const u8[]
+    var date: Date?
+    var attachments: Attachment[]
+    var attachment_total: usize
+    ## The last encoding.
+    var output: Bytes
+
+    ## Set the sender.
+    pub mutating func set_from(name: str, mailbox: str) -> !:
+        self.from_name = try self.store.keep(trim(name.bytes))
+        self.from_mailbox = try self.store.keep(trim(mailbox.bytes))
+
+    mutating func add(role: Role, name: const u8[], mailbox: const u8[]) -> !:
+        if trim(mailbox).length == 0:
+            error(incomplete, "a recipient needs an address")
+        if self.recipient_total == self.recipients.length:
+            let capacity: usize = 8 if self.recipients.length == 0 else self.recipients.length * 2
+            let grown = try alloc Recipient[capacity] in memory.heap
+            for index in 0..<self.recipient_total:
+                grown[index] = self.recipients[index]
+            if self.recipients.length > 0:
+                free(self.recipients) in memory.heap
+            self.recipients = grown
+        self.recipients[self.recipient_total] = Recipient(role = role, name = try self.store.keep(trim(name)), mailbox = try self.store.keep(trim(mailbox)))
+        self.recipient_total += 1
+
+    ## Add a To recipient.
+    pub mutating func add_to(name: str, mailbox: str) -> !:
+        try self.add(Role.to, name.bytes, mailbox.bytes)
+
+    ## Add a Cc recipient.
+    pub mutating func add_cc(name: str, mailbox: str) -> !:
+        try self.add(Role.cc, name.bytes, mailbox.bytes)
+
+    ## Add a Bcc recipient: on the envelope, never in the header.
+    pub mutating func add_bcc(name: str, mailbox: str) -> !:
+        try self.add(Role.bcc, name.bytes, mailbox.bytes)
+
+    ## Add every address in `line`, as a user types it into a To, Cc or Bcc field
+    ## (`role` is "to", "cc" or "bcc"); how many were added.
+    pub mutating func add_recipients(role: str, line: str) -> usize!:
+        let kind = Role.cc if same(role.bytes, b"cc") else (Role.bcc if same(role.bytes, b"bcc") else Role.to)
+        var pool: TextPool
+        defer pool.close()
+        var list: AddressList
+        defer list.close()
+        try read_addresses(line.bytes, &pool, &list)
+        for index in 0..<list.length():
+            let address = try list.at(index)
+            try self.add(kind, address.name.bytes, address.mailbox.bytes)
+        return list.length()
+
+    ## Set the subject.
+    pub mutating func set_subject(text: str) -> !:
+        self.subject = try self.store.keep(text.bytes)
+
+    ## Set the plain-text body.
+    pub mutating func set_text(text: str) -> !:
+        self.body = try self.store.keep(text.bytes)
+
+    ## Make the draft a reply to the message with ID `id` (without brackets), whose
+    ## References were `references`.
+    pub mutating func set_reply(id: str, references: str = "") -> !:
+        self.in_reply_to = try self.store.keep(trim(id.bytes))
+        self.references = try self.store.keep(trim(references.bytes))
+
+    ## Set the Date, instead of now.
+    pub mutating func set_date(seconds: i64, offset: i64 = 0):
+        self.date = Date(seconds = seconds, offset = offset)
+
+    ## Set the Message-ID (without brackets), instead of a made one.
+    pub mutating func set_message_id(id: str) -> !:
+        self.message_id = try self.store.keep(trim(id.bytes))
+
+    ## Attach `data` as a file called `name` of media type `kind` (guessed from the name when empty).
+    pub mutating func attach(name: str, kind: str, data: const u8[]) -> !:
+        if self.attachment_total == self.attachments.length:
+            let capacity: usize = 4 if self.attachments.length == 0 else self.attachments.length * 2
+            let grown = try alloc Attachment[capacity] in memory.heap
+            for index in 0..<self.attachment_total:
+                grown[index] = self.attachments[index]
+            if self.attachments.length > 0:
+                free(self.attachments) in memory.heap
+            self.attachments = grown
+        let chosen = kind if kind.length > 0 else guess_type(name)
+        self.attachments[self.attachment_total] = Attachment(name = try self.store.keep(name.bytes), media_type = try self.store.keep(chosen.bytes), data = try self.store.keep(data))
+        self.attachment_total += 1
+
+    ## Attach the file at `path` under its own name.
+    pub mutating func attach_file(path: str, kind: str = "") -> !:
+        let terminated = try strings.copy(path)
+        defer strings.release(terminated)
+        let data = try files.read((c.str)terminated)
+        defer free(data)
+        var name = path
+        if let slash = strings.last(path, '/'):
+            name = (str)path.bytes[slash + 1..]
+        try self.attach(name, kind, data)
+
+    ## The envelope sender.
+    pub func sender() -> str:
+        return (str)self.from_mailbox
+
+    ## How many envelope recipients there are: To, Cc and Bcc.
+    pub func recipient_count() -> usize:
+        return self.recipient_total
+
+    ## The mailbox of envelope recipient `index`.
+    pub func recipient(index: usize) -> str!:
+        if index >= self.recipient_total:
+            error(out_of_range, "no recipient at that index")
+        return (str)self.recipients[index].mailbox
+
+    ## The Message-ID the message has or will be written with, without brackets.
+    pub mutating func identity() -> str!:
+        if self.message_id.length == 0:
+            var id: Bytes
+            defer id.close()
+            let seed = (u64)time.unix() ^ time.now() ^ hash(self.body.length) ^ hash(self.recipient_total)
+            try put_hex(seed, &id)
+            try id.byte('.')
+            try put_hex(hash(time.now()), &id)
+            try id.byte('@')
+            let at = index_of(self.from_mailbox, '@')
+            if let found = at:
+                try id.put(self.from_mailbox[found + 1..])
+            else:
+                try id.put(b"luced-message.local")
+            self.message_id = try self.store.keep(id.view())
+        return (str)self.message_id
+
+    ## Write one header field, folding its value at spaces to stay under 78 columns.
+    mutating func field(name: str, value: const u8[]) -> !:
+        try self.output.text(name)
+        try self.output.put(b": ")
+        var column = name.length + 2
+        var start: usize = 0
+        while start < value.length:
+            var end = index_of(value, ' ', start) else value.length
+            if end == start:
+                end = start + 1
+            let word = value[start..<end]
+            if column + word.length > 78 and column > name.length + 2:
+                try self.output.put(b"\r\n")
+                column = 0
+            try self.output.put(word)
+            column += word.length
+            start = end
+        try self.output.put(b"\r\n")
+
+    ## Write an address field holding every recipient in `role`.
+    mutating func address_field(name: str, role: Role) -> !:
+        var value: Bytes
+        defer value.close()
+        for index in 0..<self.recipient_total:
+            let recipient = self.recipients[index]
+            if recipient.role != role:
+                continue
+            if value.used > 0:
+                try value.put(b", ")
+            try write_address(recipient.name, recipient.mailbox, &value)
+        if value.used > 0:
+            try self.field(name, value.view())
+
+    ## Write the plain-text body part's headers and content.
+    mutating func text_part() -> !:
+        var normalized: Bytes
+        defer normalized.close()
+        try crlf(self.body, &normalized)
+        # 7bit when it can be; `=_` could only collide with a boundary in plain text.
+        let plain = is_ascii(normalized.view()) and short_lines(normalized.view()) and not strings.contains((str)normalized.view(), "=_")
+        try self.output.put(b"Content-Type: text/plain; charset=utf-8\r\n")
+        if plain:
+            try self.output.put(b"Content-Transfer-Encoding: 7bit\r\n\r\n")
+            try self.output.put(normalized.view())
+        else:
+            try self.output.put(b"Content-Transfer-Encoding: quoted-printable\r\n\r\n")
+            try encode_quoted(normalized.view(), &self.output)
+        if self.output.used < 2 or self.output.view()[self.output.used - 1] != '\n':
+            try self.output.put(b"\r\n")
+
+    ## The whole message, 7-bit with CRLF line ends.
+    pub mutating func encode() -> str!:
+        if self.from_mailbox.length == 0:
+            error(incomplete, "the message has no sender")
+        if self.recipient_total == 0:
+            error(incomplete, "the message has no recipient")
+        self.output.clear()
+        var value: Bytes
+        defer value.close()
+        let date = self.date else Date(seconds = time.unix(), offset = 0)
+        try write_date(date, &value)
+        try self.field("Date", value.view())
+        value.clear()
+        try write_address(self.from_name, self.from_mailbox, &value)
+        try self.field("From", value.view())
+        try self.address_field("To", Role.to)
+        try self.address_field("Cc", Role.cc)
+        value.clear()
+        try encode_text(self.subject, &value)
+        try self.field("Subject", value.view())
+        value.clear()
+        try value.byte('<')
+        try value.text(try self.identity())
+        try value.byte('>')
+        try self.field("Message-ID", value.view())
+        if self.in_reply_to.length > 0:
+            value.clear()
+            try value.byte('<')
+            try value.put(self.in_reply_to)
+            try value.byte('>')
+            try self.field("In-Reply-To", value.view())
+            value.clear()
+            if self.references.length > 0:
+                try value.put(self.references)
+                try value.byte(' ')
+            try value.byte('<')
+            try value.put(self.in_reply_to)
+            try value.byte('>')
+            try self.field("References", value.view())
+        try self.output.put(b"MIME-Version: 1.0\r\n")
+        if self.attachment_total == 0:
+            try self.text_part()
+            return (str)self.output.view()
+        var boundary: Bytes
+        defer boundary.close()
+        try boundary.put(b"=_luce_")
+        try put_hex(hash(self.message_id.length) ^ time.now(), &boundary)
+        try self.output.put(b"Content-Type: multipart/mixed; boundary=\"")
+        try self.output.put(boundary.view())
+        try self.output.put(b"\"\r\n\r\nThis is a multi-part message in MIME format.\r\n")
+        try self.delimiter(boundary.view(), false)
+        try self.text_part()
+        for index in 0..<self.attachment_total:
+            let attachment = self.attachments[index]
+            try self.delimiter(boundary.view(), false)
+            try self.output.put(b"Content-Type: ")
+            try self.output.put(attachment.media_type)
+            try self.output.put(b"\r\nContent-Transfer-Encoding: base64\r\n")
+            value.clear()
+            try value.put(b"attachment; filename")
+            if is_ascii(attachment.name) and index_of(attachment.name, '"') == none:
+                try value.put(b"=\"")
+                try value.put(attachment.name)
+                try value.byte('"')
+            else:
+                # RFC 2231: filename*=utf-8''percent-encoded
+                try value.put(b"*=utf-8''")
+                for byte in attachment.name:
+                    if is_atext(byte) and byte != '%' and byte != '\'' and byte != '*':
+                        try value.byte(byte)
+                    else:
+                        try value.byte('%')
+                        try value.byte(hex_digit(byte >> 4))
+                        try value.byte(hex_digit(byte & 15))
+            try self.field("Content-Disposition", value.view())
+            try self.output.put(b"\r\n")
+            try encode_base64(attachment.data, &self.output)
+        try self.delimiter(boundary.view(), true)
+        return (str)self.output.view()
+
+    ## Write a boundary line; `last` closes the multipart.
+    mutating func delimiter(boundary: const u8[], last: bool) -> !:
+        try self.output.put(b"--")
+        try self.output.put(boundary)
+        if last:
+            try self.output.put(b"--")
+        try self.output.put(b"\r\n")
+
+    ## Give everything back.
+    pub mutating func close():
+        self.store.close()
+        self.output.close()
+        if self.recipients.length > 0:
+            free(self.recipients) in memory.heap
+        if self.attachments.length > 0:
+            free(self.attachments) in memory.heap
+        var no_recipients: Recipient[]
+        self.recipients = no_recipients
+        var no_attachments: Attachment[]
+        self.attachments = no_attachments
+        self.recipient_total = 0
+        self.attachment_total = 0
+
+## The interop type of a `Draft`.
+pub let draft_type: interop.Type[Draft] = interop.Type[Draft]("MIME draft", Draft.close, closeable = true)
+
+## A new, empty Draft object for Luce.
+pub func create_draft() -> interop.Reference[Draft]!:
+    let native = try new Draft in memory.heap
+    errdefer free(native) in memory.heap
+    return try interop.Reference[Draft].adopt(native, draft_type)
+
+## Append `value` as sixteen lower-case hexadecimal digits.
+func put_hex(value: u64, out: Bytes*) -> !:
+    var shift: u64 = 60
+    while true:
+        try out.byte("0123456789abcdef".bytes[(value >> shift) & 15])
+        if shift == 0:
+            break
+        shift -= 4
+
+## Append `data` with every line ending as CRLF.
+func crlf(data: const u8[], out: Bytes*) -> !:
+    var index: usize = 0
+    while index < data.length:
+        let byte = data[index]
+        if byte == '\r':
+            try out.put(b"\r\n")
+            index += 2 if index + 1 < data.length and data[index + 1] == '\n' else 1
+            continue
+        if byte == '\n':
+            try out.put(b"\r\n")
+        else:
+            try out.byte(byte)
+        index += 1
+
+## Whether every line of `data` is short enough to send as it is (RFC 5322's 998 less
+## a margin).
+func short_lines(data: const u8[]) -> bool:
+    var column: usize = 0
+    for byte in data:
+        if byte == '\n':
+            column = 0
+        else:
+            column += 1
+            if column > 900:
+                return false
+    return true
+
+## A media type for file `name` from its extension; application/octet-stream otherwise.
+pub func guess_type(name: str) -> str:
+    let dot = strings.last(name, '.') else return "application/octet-stream"
+    let extension = name.bytes[dot + 1..]
+    let known: (str, str)[22] = [
+        ("pdf", "application/pdf"), ("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"),
+        ("gif", "image/gif"), ("webp", "image/webp"), ("heic", "image/heic"), ("svg", "image/svg+xml"),
+        ("txt", "text/plain"), ("html", "text/html"), ("htm", "text/html"), ("csv", "text/csv"),
+        ("zip", "application/zip"), ("json", "application/json"), ("ics", "text/calendar"),
+        ("eml", "message/rfc822"), ("doc", "application/msword"), ("mp3", "audio/mpeg"),
+        ("mp4", "video/mp4"), ("mov", "video/quicktime"), ("tif", "image/tiff"), ("tiff", "image/tiff"),
+    ]
+    for entry in known:
+        if same(extension, entry.0.bytes):
+            return entry.1
+    return "application/octet-stream"

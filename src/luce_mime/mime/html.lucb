@@ -1,0 +1,324 @@
+#==============================================================================================
+#
+#   mime/html - HTML made into readable text
+#
+#   DESCRIPTION:
+#       Until the window shows HTML mail through the browser engine, an HTML body is
+#       read as text: tags give structure (paragraphs and headings a blank line, line
+#       breaks and divisions a new line, list items a bullet or a number, table cells a
+#       gap, block quotes a `> ` prefix, images their alt text in brackets), runs of
+#       whitespace collapse except inside <pre>, character references are decoded, and
+#       what is never shown (head, style, script, comments) is skipped. Links show their
+#       text only. The input is already UTF-8.
+#
+#==============================================================================================
+
+## Named references outside Latin-1 that mail uses, with their scalars.
+let named_references: (str, u32)[48] = [
+    ("amp", 38), ("lt", 60), ("gt", 62), ("quot", 34), ("apos", 39), ("hellip", 0x2026),
+    ("mdash", 0x2014), ("ndash", 0x2013), ("lsquo", 0x2018), ("rsquo", 0x2019), ("sbquo", 0x201A),
+    ("ldquo", 0x201C), ("rdquo", 0x201D), ("bdquo", 0x201E), ("bull", 0x2022), ("euro", 0x20AC),
+    ("trade", 0x2122), ("zwnj", 0x200C), ("zwj", 0x200D), ("lrm", 0x200E), ("rlm", 0x200F),
+    ("thinsp", 0x2009), ("ensp", 0x2002), ("emsp", 0x2003), ("larr", 0x2190), ("rarr", 0x2192),
+    ("uarr", 0x2191), ("darr", 0x2193), ("harr", 0x2194), ("dagger", 0x2020), ("Dagger", 0x2021),
+    ("permil", 0x2030), ("prime", 0x2032), ("Prime", 0x2033), ("lsaquo", 0x2039), ("rsaquo", 0x203A),
+    ("oline", 0x203E), ("OElig", 0x0152), ("oelig", 0x0153), ("Scaron", 0x0160), ("scaron", 0x0161),
+    ("Yuml", 0x0178), ("fnof", 0x0192), ("circ", 0x02C6), ("tilde", 0x02DC), ("check", 0x2713),
+    ("star", 0x2606), ("hearts", 0x2665),
+]
+
+## The names of U+00A0-U+00FF, in order.
+let latin1_names: str[96] = [
+    "nbsp", "iexcl", "cent", "pound", "curren", "yen", "brvbar", "sect",
+    "uml", "copy", "ordf", "laquo", "not", "shy", "reg", "macr",
+    "deg", "plusmn", "sup2", "sup3", "acute", "micro", "para", "middot",
+    "cedil", "sup1", "ordm", "raquo", "frac14", "frac12", "frac34", "iquest",
+    "Agrave", "Aacute", "Acirc", "Atilde", "Auml", "Aring", "AElig", "Ccedil",
+    "Egrave", "Eacute", "Ecirc", "Euml", "Igrave", "Iacute", "Icirc", "Iuml",
+    "ETH", "Ntilde", "Ograve", "Oacute", "Ocirc", "Otilde", "Ouml", "times",
+    "Oslash", "Ugrave", "Uacute", "Ucirc", "Uuml", "Yacute", "THORN", "szlig",
+    "agrave", "aacute", "acirc", "atilde", "auml", "aring", "aelig", "ccedil",
+    "egrave", "eacute", "ecirc", "euml", "igrave", "iacute", "icirc", "iuml",
+    "eth", "ntilde", "ograve", "oacute", "ocirc", "otilde", "ouml", "divide",
+    "oslash", "ugrave", "uacute", "ucirc", "uuml", "yacute", "thorn", "yuml",
+]
+
+## Elements that end the line they are on.
+let line_elements: str[16] = ["br", "div", "tr", "li", "dt", "dd", "address", "center", "section",
+                              "article", "header", "footer", "nav", "form", "caption", "tbody"]
+## Elements set off by a blank line.
+let block_elements: str[15] = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "table",
+                               "ul", "ol", "dl", "pre", "hr", "figure"]
+## Elements whose content is never shown.
+let hidden_elements: str[6] = ["head", "style", "script", "title", "template", "xml"]
+
+## The scalar a character reference names (the text between `&` and `;`), or none.
+func reference_scalar(name: const u8[]) -> u32?:
+    if name.length > 1 and name[0] == '#':
+        var value: u32 = 0
+        let hexadecimal = name[1] == 'x' or name[1] == 'X'
+        let digits = name[2..] if hexadecimal else name[1..]
+        if digits.length == 0 or digits.length > 7:
+            return none
+        for byte in digits:
+            if hexadecimal:
+                let digit = hex_value(byte) else return none
+                value = value * 16 + digit
+            else:
+                if byte < '0' or byte > '9':
+                    return none
+                value = value * 10 + (byte - '0')
+        # Control references map as browsers map them; zero is the replacement character.
+        if value == 0:
+            return 0xFFFD
+        if value >= 0x80 and value < 0xA0:
+            return windows1252_high[value - 0x80]
+        return value
+    for entry in named_references:
+        if equal(name, entry.0.bytes):
+            return entry.1
+    for at in 0..<latin1_names.length:
+        if equal(name, latin1_names[at].bytes):
+            return 0xA0 + (u32)at
+    return none
+
+## Whether `name` is one of `names`, ignoring case.
+func is_one_of(name: const u8[], names: const str[]) -> bool:
+    for candidate in names:
+        if same(name, candidate.bytes):
+            return true
+    return false
+
+## The text being written: whitespace collapsing, line breaks, quote prefixes.
+struct TextWriter:
+    var out: Bytes*
+    ## Line breaks at the end of what was written, at most two.
+    var breaks: u32
+    var space: bool
+    var started: bool
+    var quote_depth: u32
+    var pre_depth: u32
+
+    ## Begin a line: the quote prefix.
+    mutating func begin_line() -> !:
+        var level: u32 = 0
+        while level < self.quote_depth:
+            try self.out.put(b"> ")
+            level += 1
+
+    ## Write visible text, collapsing whitespace outside <pre>.
+    mutating func text(data: const u8[]) -> !:
+        for byte in data:
+            if self.pre_depth > 0 and byte == '\n':
+                try self.out.byte('\n')
+                self.breaks = 1
+                self.started = true
+                continue
+            if self.pre_depth == 0 and is_space(byte):
+                self.space = true
+                continue
+            if self.breaks > 0 or not self.started:
+                try self.begin_line()
+            elif self.space:
+                try self.out.byte(' ')
+            self.space = false
+            self.breaks = 0
+            self.started = true
+            try self.out.byte(byte)
+
+    ## Write one scalar as visible text.
+    mutating func scalar(scalar: u32) -> !:
+        if scalar == 0xA0:
+            try self.text(b"\xC2\xA0")
+            return
+        var buffer: u8[4]
+        let count = utf8.encode(scalar, buffer) else 0
+        if count == 0:
+            try self.text(b"\xEF\xBF\xBD")
+        else:
+            try self.text(buffer[0..<count])
+
+    ## A line break, as <br> makes: two in a row leave a blank line, more add nothing.
+    mutating func line_break() -> !:
+        self.space = false
+        if self.started and self.breaks < 2:
+            try self.out.byte('\n')
+            self.breaks += 1
+
+    ## End the line, then leave `count` line breaks in all (a blank line for two).
+    mutating func breaks_to(count: u32) -> !:
+        self.space = false
+        if not self.started:
+            return
+        while self.breaks < count:
+            try self.out.byte('\n')
+            self.breaks += 1
+
+## The tag starting at `start` (at `<`): its name, whether it closes, and where it ends.
+struct Tag:
+    var name: const u8[]
+    var closing: bool
+    var start: usize
+    var end: usize
+
+## Read the tag at `start`; none when `<` does not begin one.
+func read_tag(data: const u8[], start: usize) -> Tag?:
+    var index = start + 1
+    var closing = false
+    if index < data.length and data[index] == '/':
+        closing = true
+        index += 1
+    let name_start = index
+    while index < data.length and ((data[index] >= 'a' and data[index] <= 'z') or (data[index] >= 'A' and data[index] <= 'Z') or (data[index] >= '0' and data[index] <= '9')):
+        index += 1
+    if index == name_start:
+        return none
+    let name = data[name_start..<index]
+    # Attributes run to the `>` that is outside quotes.
+    var quote: u8 = 0
+    while index < data.length:
+        let byte = data[index]
+        if quote != 0:
+            if byte == quote:
+                quote = 0
+        elif byte == '"' or byte == '\'':
+            quote = byte
+        elif byte == '>':
+            return Tag(name = name, closing = closing, start = start, end = index + 1)
+        index += 1
+    return Tag(name = name, closing = closing, start = start, end = data.length)
+
+## The value of attribute `name` inside tag text `tag`, or none.
+func attribute_value(tag: const u8[], name: str) -> const u8[]?:
+    var index: usize = 1
+    while index + name.length < tag.length:
+        if is_space(tag[index - 1]) and starts(tag[index..], name.bytes):
+            var at = index + name.length
+            while at < tag.length and is_space(tag[at]):
+                at += 1
+            if at < tag.length and tag[at] == '=':
+                at += 1
+                while at < tag.length and is_space(tag[at]):
+                    at += 1
+                if at < tag.length and (tag[at] == '"' or tag[at] == '\''):
+                    let quote = tag[at]
+                    let close = index_of(tag, quote, at + 1) else tag.length
+                    return tag[at + 1..<close]
+                var stop = at
+                while stop < tag.length and not is_space(tag[stop]) and tag[stop] != '>':
+                    stop += 1
+                return tag[at..<stop]
+        index += 1
+    return none
+
+## HTML being read: the text writer and the list being numbered.
+struct HtmlReader:
+    var writer: TextWriter
+    var ordered: u32
+    var in_ordered: bool
+
+    ## Act on `tag` from `data`; where reading continues.
+    mutating func tag(data: const u8[], tag: Tag) -> usize!:
+        let name = tag.name
+        if not tag.closing and is_one_of(name, hidden_elements):
+            # Skip to the matching close tag.
+            var at = tag.end
+            while at < data.length:
+                if data[at] == '<' and at + 2 + name.length <= data.length and data[at + 1] == '/' and same(data[at + 2..<at + 2 + name.length], name):
+                    return (index_of(data, '>', at) else (data.length - 1)) + 1
+                at += 1
+            return data.length
+        if same(name, b"br"):
+            try self.writer.line_break()
+        elif same(name, b"blockquote"):
+            try self.writer.breaks_to(2)
+            if not tag.closing:
+                self.writer.quote_depth += 1
+            elif self.writer.quote_depth > 0:
+                self.writer.quote_depth -= 1
+        elif same(name, b"pre"):
+            try self.writer.breaks_to(2)
+            if not tag.closing:
+                self.writer.pre_depth += 1
+            elif self.writer.pre_depth > 0:
+                self.writer.pre_depth -= 1
+        elif same(name, b"ol") or same(name, b"ul"):
+            self.in_ordered = same(name, b"ol") and not tag.closing
+            self.ordered = 0
+            try self.writer.breaks_to(2 if tag.closing else 1)
+        elif same(name, b"li"):
+            if not tag.closing:
+                try self.writer.breaks_to(1)
+                if self.in_ordered:
+                    self.ordered += 1
+                    var number: Bytes
+                    defer number.close()
+                    try put_number((i64)self.ordered, 1, &number)
+                    try number.byte('.')
+                    try self.writer.text(number.view())
+                else:
+                    try self.writer.text("•".bytes)
+                # The space after the marker, written before the item's first word.
+                self.writer.space = true
+        elif same(name, b"hr"):
+            try self.writer.breaks_to(2)
+            try self.writer.text(b"----------")
+            try self.writer.breaks_to(2)
+        elif same(name, b"td") or same(name, b"th"):
+            if not tag.closing and self.writer.breaks == 0 and self.writer.started:
+                try self.writer.out.put(b"  ")
+        elif same(name, b"img"):
+            if let alt = attribute_value(data[tag.start..<tag.end], "alt"):
+                if trim(alt).length > 0:
+                    try self.writer.text(b" [")
+                    try self.writer.text(trim(alt))
+                    try self.writer.text(b"] ")
+        elif is_one_of(name, block_elements):
+            try self.writer.breaks_to(2)
+        elif is_one_of(name, line_elements):
+            try self.writer.breaks_to(1)
+        return tag.end
+
+## The offset just past the comment, declaration or processing instruction at `start`.
+func skip_markup(data: const u8[], start: usize) -> usize:
+    if starts(data[start..], b"<!--"):
+        var at = start + 4
+        while at + 2 < data.length:
+            if data[at] == '-' and data[at + 1] == '-' and data[at + 2] == '>':
+                return at + 3
+            at += 1
+        return data.length
+    return (index_of(data, '>', start) else (data.length - 1)) + 1
+
+## Append HTML `data` (UTF-8) as readable text.
+pub func html_to_text(data: const u8[], out: Bytes*) -> !:
+    var reader = HtmlReader(writer = TextWriter(out = out))
+    var index: usize = 0
+    while index < data.length:
+        let byte = data[index]
+        if byte == '<':
+            if index + 1 < data.length and (data[index + 1] == '!' or data[index + 1] == '?'):
+                index = skip_markup(data, index)
+            elif let tag = read_tag(data, index):
+                index = try reader.tag(data, tag)
+            else:
+                try reader.writer.text(b"<")
+                index += 1
+            continue
+        if byte == '&':
+            var end = index + 1
+            while end < data.length and end - index < 12 and data[end] != ';' and not is_space(data[end]) and data[end] != '&' and data[end] != '<':
+                end += 1
+            if end < data.length and data[end] == ';':
+                if let scalar = reference_scalar(data[index + 1..<end]):
+                    try reader.writer.scalar(scalar)
+                    index = end + 1
+                    continue
+            try reader.writer.text(b"&")
+            index += 1
+            continue
+        var end = index + 1
+        while end < data.length and data[end] != '<' and data[end] != '&':
+            end += 1
+        try reader.writer.text(data[index..<end])
+        index = end

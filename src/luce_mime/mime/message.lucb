@@ -1,0 +1,426 @@
+#==============================================================================================
+#
+#   mime/message - A parsed message and what a reader asks of it
+#
+#   DESCRIPTION:
+#       `parse` copies the message's bytes and reads its part tree; nothing else is
+#       decoded until asked. Header text, addresses, a part's content and the body text
+#       are decoded on request into the message's pool and handed out as views, valid
+#       until `close`. From Luce, a Message is an object (`mime.parse(data)`) and each
+#       text it returns is an owned copy.
+#
+#       The body a reader shows (`body_text`) walks the tree as a mail client does: of a
+#       multipart/alternative it takes the plain text if there is one and the HTML
+#       otherwise, of other multiparts every inline text part in order; HTML is made
+#       into text. Attachments are the parts a user would save: those marked as
+#       attachments, and every non-text leaf.
+#
+#==============================================================================================
+
+## Address fields a message may hold, for the address accessors.
+let address_fields: str[7] = ["from", "sender", "reply-to", "to", "cc", "bcc", "delivered-to"]
+
+## A parsed message.
+pub struct Message:
+    var raw: u8[]
+    var pool: TextPool
+    var parts: PartList
+
+    ## Parse a copy of `data`.
+    pub static func read(data: const u8[]) -> Message!:
+        if data.length > maximum_message:
+            error(limit_exceeded, "the message is larger than this package reads")
+        let raw = try new u8[data.length] in memory.heap
+        memory.copy(raw, data, data.length)
+        var message = Message(raw = raw)
+        errdefer message.close()
+        try read_entity(message.raw, 0, message.raw.length, -1, 0, false, &message.parts)
+        return message
+
+    static func own(native: Message*) -> interop.Reference[Message]!:
+        return try interop.Reference[Message].adopt(native, message_type)
+
+    ## The message's bytes, as parsed.
+    pub func bytes() -> const u8[]:
+        return self.raw
+
+    ## The size of the message in bytes.
+    pub func size() -> usize:
+        return self.raw.length
+
+    ## The top-level header.
+    func header_block() -> const Header*:
+        return &self.parts.items[0].header
+
+    # mark: header fields ========================================================================
+
+    ## The text of the first header field called `name`: unfolded, encoded words decoded.
+    pub mutating func header(name: str) -> str?!:
+        let value = self.header_block().find(name) else return none
+        return try self.text_of(value)
+
+    ## The text of the first `name` field, or empty text when there is none.
+    pub mutating func field(name: str) -> str!:
+        return (try self.header(name)) else ""
+
+    ## How many fields the top-level header has.
+    pub func field_count() -> usize:
+        return self.header_block().length()
+
+    ## The name of field `index`, as written.
+    pub func field_name(index: usize) -> str!:
+        let field = try self.header_block().at(index)
+        return (str)field.name
+
+    ## The text of field `index`.
+    pub mutating func field_value(index: usize) -> str!:
+        let field = try self.header_block().at(index)
+        return try self.text_of(field.value)
+
+    mutating func text_of(value: const u8[]) -> str!:
+        var text: Bytes
+        defer text.close()
+        try header_text(value, &text)
+        return (str)(try self.pool.keep(text.view()))
+
+    ## The subject, or empty text.
+    pub mutating func subject() -> str!:
+        return try self.field("Subject")
+
+    ## The first message ID in field `name`, without its angle brackets; empty when none.
+    mutating func message_id_in(name: str) -> str!:
+        let value = self.header_block().find(name) else return ""
+        let trimmed = trim(value)
+        if let first = index_of(trimmed, '<'):
+            if let last = index_of(trimmed, '>', first):
+                return (str)(try self.pool.keep(trim(trimmed[first + 1..<last])))
+        return (str)(try self.pool.keep(trimmed))
+
+    ## The Message-ID, without angle brackets.
+    pub mutating func message_id() -> str!:
+        return try self.message_id_in("Message-ID")
+
+    ## The In-Reply-To ID, without angle brackets.
+    pub mutating func in_reply_to() -> str!:
+        return try self.message_id_in("In-Reply-To")
+
+    ## The References field unfolded: message IDs with their brackets, space separated.
+    pub mutating func references() -> str!:
+        let value = self.header_block().find("References") else return ""
+        var text: Bytes
+        defer text.close()
+        try unfold(value, &text)
+        return (str)(try self.pool.keep(text.view()))
+
+    ## The Date field, or none when it is missing or unreadable.
+    pub func date() -> Date?:
+        let value = self.header_block().find("Date") else return none
+        return read_date(value)
+
+    ## The date in seconds since 1970 UTC, or zero when there is none.
+    pub func date_seconds() -> i64:
+        if let date = self.date():
+            return date.seconds
+        return 0
+
+    ## The sender's offset from UTC in minutes, or zero.
+    pub func date_offset() -> i64:
+        if let date = self.date():
+            return date.offset
+        return 0
+
+    # mark: addresses ============================================================================
+
+    ## The addresses of every `name` field (From, To, Cc, …) in order. The caller closes
+    ## the list; its text lives in the message.
+    pub mutating func addresses(name: str) -> AddressList!:
+        var list: AddressList
+        errdefer list.close()
+        var nth: usize = 0
+        while let value = self.header_block().find_nth(name, nth):
+            try read_addresses(value, &self.pool, &list)
+            nth += 1
+        return list
+
+    ## How many addresses field `name` holds.
+    pub mutating func address_count(name: str) -> usize!:
+        var list = try self.addresses(name)
+        defer list.close()
+        return list.length()
+
+    ## The display name of address `index` of field `name`; empty when it has none.
+    pub mutating func address_name(name: str, index: usize) -> str!:
+        var list = try self.addresses(name)
+        defer list.close()
+        return (try list.at(index)).name
+
+    ## The mailbox (`local@domain`) of address `index` of field `name`.
+    pub mutating func address_mailbox(name: str, index: usize) -> str!:
+        var list = try self.addresses(name)
+        defer list.close()
+        return (try list.at(index)).mailbox
+
+    ## Field `name`'s addresses as a reader shows them: `Name <mailbox>, …`, the name
+    ## alone when `short`.
+    pub mutating func address_line(name: str, short: bool = false) -> str!:
+        var list = try self.addresses(name)
+        defer list.close()
+        var line: Bytes
+        defer line.close()
+        for index in 0..<list.length():
+            let address = try list.at(index)
+            if index > 0:
+                try line.put(b", ")
+            if address.name.length > 0:
+                try line.text(address.name)
+                if not short:
+                    try line.put(b" <")
+                    try line.text(address.mailbox)
+                    try line.byte('>')
+            else:
+                try line.text(address.mailbox)
+        return (str)(try self.pool.keep(line.view()))
+
+    # mark: parts ================================================================================
+
+    ## How many parts the tree has; part 0 is the message itself.
+    pub func part_count() -> usize:
+        return self.parts.length()
+
+    ## The index of part `index`'s parent; -1 for the message.
+    pub func part_parent(index: usize) -> i64!:
+        return (try self.parts.at(index)).parent
+
+    ## How many parts enclose part `index`.
+    pub func part_depth(index: usize) -> u32!:
+        return (try self.parts.at(index)).depth
+
+    ## Part `index`'s media type in lower case, `text/plain`.
+    pub mutating func part_type(index: usize) -> str!:
+        let part = try self.parts.at(index)
+        var text: Bytes
+        defer text.close()
+        for byte in part.kind:
+            try text.byte(lower(byte))
+        try text.byte('/')
+        for byte in part.subtype:
+            try text.byte(lower(byte))
+        return (str)(try self.pool.keep(text.view()))
+
+    ## Part `index`'s file name, or empty text.
+    pub mutating func part_filename(index: usize) -> str!:
+        let part = try self.parts.at(index)
+        var name: Bytes
+        defer name.close()
+        discard(try file_name(part, &name))
+        return (str)(try self.pool.keep(name.view()))
+
+    ## Part `index`'s charset parameter, or empty text.
+    pub mutating func part_charset(index: usize) -> str!:
+        return try self.part_parameter(index, "Content-Type", "charset")
+
+    ## Part `index`'s Content-ID, without angle brackets.
+    pub mutating func part_content_id(index: usize) -> str!:
+        let part = try self.parts.at(index)
+        let value = part.header.find("Content-ID") else return ""
+        var text = trim(value)
+        if text.length >= 2 and text[0] == '<' and text[text.length - 1] == '>':
+            text = text[1..<text.length - 1]
+        return (str)(try self.pool.keep(text))
+
+    mutating func part_parameter(index: usize, field: str, name: str) -> str!:
+        let part = try self.parts.at(index)
+        var text: Bytes
+        defer text.close()
+        if let value = part.header.find(field):
+            discard(try parameter(value, name, &text))
+        return (str)(try self.pool.keep(text.view()))
+
+    ## Whether part `index` is an attachment: marked as one, or a leaf that is not text
+    ## shown in the body.
+    pub func part_is_attachment(index: usize) -> bool!:
+        let part = try self.parts.at(index)
+        if part.is("multipart"):
+            return false
+        if same(disposition(part), b"attachment"):
+            return true
+        if part.parent >= 0 and (try self.parts.at((usize)part.parent)).is("message"):
+            # The body of a forwarded message belongs to that message.
+            return false
+        return not (part.is("text", "plain") or part.is("text", "html"))
+
+    ## The encoded size of part `index`'s body in bytes.
+    pub func part_size(index: usize) -> usize!:
+        let part = try self.parts.at(index)
+        return part.body_end - part.body_start
+
+    ## Part `index`'s content with its transfer encoding undone.
+    pub mutating func part_data(index: usize) -> const u8[]!:
+        let part = try self.parts.at(index)
+        var data: Bytes
+        defer data.close()
+        try decode_body(self.raw, part, &data)
+        return try self.pool.keep(data.view())
+
+    ## Part `index`'s content as UTF-8 text, converted from its charset.
+    pub mutating func part_text(index: usize) -> str!:
+        let part = try self.parts.at(index)
+        var text: Bytes
+        defer text.close()
+        try decode_text(self.raw, part, &text)
+        return (str)(try self.pool.keep(text.view()))
+
+    ## Write part `index`'s decoded content to the file at `path`.
+    pub func save_part(index: usize, path: str) -> !:
+        let part = try self.parts.at(index)
+        var data: Bytes
+        defer data.close()
+        try decode_body(self.raw, part, &data)
+        let terminated = try strings.copy(path)
+        defer strings.release(terminated)
+        try files.write((c.str)terminated, data.view())
+
+    ## How many attachments there are.
+    pub func attachment_count() -> usize!:
+        var count: usize = 0
+        for index in 0..<self.parts.length():
+            if try self.part_is_attachment(index):
+                count += 1
+        return count
+
+    ## The part index of attachment `nth`.
+    pub func attachment(nth: usize) -> usize!:
+        var seen: usize = 0
+        for index in 0..<self.parts.length():
+            if try self.part_is_attachment(index):
+                if seen == nth:
+                    return index
+                seen += 1
+        error(out_of_range, "no attachment at that index")
+
+    # mark: the body a reader shows ==============================================================
+
+    ## Append the text of part `index` and of what it holds, as a reader shows it.
+    mutating func gather(index: usize, html: bool, out: Bytes*) -> !:
+        let part = try self.parts.at(index)
+        if part.is("multipart"):
+            let children = self.children(index)
+            if part.is("multipart", "alternative"):
+                # The plain alternative; the HTML one when asked or when there is no other.
+                var chosen: usize? = none
+                for child in children.0..<children.1:
+                    let candidate = try self.parts.at(child)
+                    if candidate.parent != (i64)index:
+                        continue
+                    let wanted = candidate.is("text", "html") if html else candidate.is("text", "plain")
+                    if wanted or chosen == none:
+                        chosen = child
+                if let child = chosen:
+                    try self.gather(child, html, out)
+                return
+            for child in children.0..<children.1:
+                if (try self.parts.at(child)).parent == (i64)index:
+                    try self.gather(child, html, out)
+            return
+        if same(disposition(part), b"attachment"):
+            return
+        let plain = part.is("text", "plain")
+        let rich = part.is("text", "html")
+        if not plain and not rich:
+            return
+        if out.used > 0:
+            try out.put(b"\n\n")
+        var text: Bytes
+        defer text.close()
+        try decode_text(self.raw, part, &text)
+        if rich and not html:
+            try html_to_text(text.view(), out)
+        else:
+            try out.put(text.view())
+
+    ## The parts after `index` that lie inside it: a half-open range of part indices.
+    func children(index: usize) -> (usize, usize):
+        let depth = self.parts.items[index].depth
+        var end = index + 1
+        while end < self.parts.count and self.parts.items[end].depth > depth:
+            end += 1
+        return (index + 1, end)
+
+    ## The text a reader shows for the body: plain text, or HTML made into text.
+    pub mutating func body_text() -> str!:
+        var text: Bytes
+        defer text.close()
+        try self.gather(0, false, &text)
+        return (str)(try self.pool.keep(trim(text.view())))
+
+    ## The HTML body, when the message has one; empty text otherwise.
+    pub mutating func body_html() -> str!:
+        for index in 0..<self.parts.length():
+            let part = try self.parts.at(index)
+            if part.is("text", "html") and not same(disposition(part), b"attachment"):
+                return try self.part_text(index)
+        return ""
+
+    ## The opening of the body on one line, for a message list: quoted lines and
+    ## signatures skipped, whitespace collapsed, at most `limit` characters.
+    pub mutating func preview(limit: usize = 200) -> str!:
+        var body: Bytes
+        defer body.close()
+        try self.gather(0, false, &body)
+        var line: Bytes
+        defer line.close()
+        var characters: usize = 0
+        var space = false
+        var at_line_start = true
+        var skipping = false
+        for byte in body.view():
+            if at_line_start:
+                skipping = byte == '>'
+                at_line_start = false
+            if byte == '\n':
+                at_line_start = true
+                space = line.used > 0
+                continue
+            if skipping:
+                continue
+            if is_space(byte):
+                space = line.used > 0
+                continue
+            # Count characters, not bytes: continuation bytes do not start one.
+            if (byte & 0xC0) != 0x80:
+                if characters == limit:
+                    break
+                characters += 1
+                if space:
+                    try line.byte(' ')
+                    characters += 1
+            space = false
+            try line.byte(byte)
+        return (str)(try self.pool.keep(line.view()))
+
+    ## Give everything back; every view handed out becomes invalid.
+    pub mutating func close():
+        self.parts.close()
+        self.pool.close()
+        if self.raw.length > 0:
+            free(self.raw) in memory.heap
+        var empty: u8[]
+        self.raw = empty
+
+## The interop type of a `Message`.
+pub let message_type: interop.Type[Message] = interop.Type[Message]("MIME message", Message.close, closeable = true)
+
+## Parse a copy of `data` into a Message object for Luce.
+pub func parse(data: const u8[]) -> interop.Reference[Message]!:
+    let native = try new Message in memory.heap
+    errdefer free(native) in memory.heap
+    *native = try Message.read(data)
+    return try Message.own(native)
+
+## Read and parse the message in the file at `path`.
+pub func open(path: str) -> interop.Reference[Message]!:
+    let terminated = try strings.copy(path)
+    defer strings.release(terminated)
+    let data = try files.read((c.str)terminated)
+    defer free(data)
+    return try parse(data)

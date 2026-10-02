@@ -1,0 +1,127 @@
+#==============================================================================================
+#
+#   mime/pool - Decoded text kept at stable addresses
+#
+#   DESCRIPTION:
+#       A Message decodes lazily: a header's encoded words, a part's base64 body, an
+#       address list. Each result is copied into the message's TextPool, which grows by
+#       whole chunks and never moves what it already holds, so every view handed out
+#       stays valid until the message closes. Everything is allocated from the heap.
+#
+#==============================================================================================
+
+## The size of an ordinary chunk; a larger request gets a chunk of its own size.
+let chunk_size: usize = 16384
+
+## A growable run of bytes on the heap: where a decoder writes before its result is kept.
+## Growing moves the bytes, so a view lasts only until the next `put`.
+pub struct Bytes:
+    var data: u8[]
+    var used: usize
+
+    ## Room for `extra` more bytes.
+    mutating func reserve(extra: usize) -> !:
+        let needed = self.used +? extra else error(limit_exceeded, "the decoded text is too large")
+        if needed <= self.data.length:
+            return
+        var capacity: usize = 256 if self.data.length == 0 else self.data.length * 2
+        while capacity < needed:
+            capacity *= 2
+        let grown = try new u8[capacity] in memory.heap
+        memory.copy(grown, self.data, self.used)
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        self.data = grown
+
+    ## Append `data`.
+    pub mutating func put(data: const u8[]) -> !:
+        try self.reserve(data.length)
+        memory.copy(self.data[self.used..], data, data.length)
+        self.used += data.length
+
+    ## Append `text`.
+    pub mutating func text(text: str) -> !:
+        try self.put(text.bytes)
+
+    ## Append one byte.
+    pub mutating func byte(value: u8) -> !:
+        if self.used == self.data.length:
+            try self.reserve(1)
+        self.data[self.used] = value
+        self.used += 1
+
+    ## Append the UTF-8 encoding of `scalar`; a value that is not a scalar becomes U+FFFD.
+    pub mutating func scalar(scalar: u32) -> !:
+        var buffer: u8[4]
+        let count = utf8.encode(scalar, buffer) else 0
+        if count == 0:
+            try self.put(b"\xEF\xBF\xBD")
+            return
+        try self.put(buffer[0..<count])
+
+    ## The bytes so far, valid until the next append.
+    pub func view() -> const u8[]:
+        return self.data[0..<self.used]
+
+    ## Forget the contents, keeping the storage.
+    pub mutating func clear():
+        self.used = 0
+
+    ## Give the storage back.
+    pub mutating func close():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: u8[]
+        self.data = empty
+        self.used = 0
+
+## Bytes kept at stable addresses until `close`.
+pub struct TextPool:
+    var chunks: u8[][]
+    var count: usize
+    ## Bytes used in the newest chunk.
+    var used: usize
+
+    ## Room for `size` bytes that will not move: a span of exactly that length.
+    mutating func reserve(size: usize) -> u8[]!:
+        if size == 0:
+            var empty: u8[]
+            return empty
+        if self.count > 0 and self.chunks[self.count - 1].length - self.used >= size:
+            let start = self.used
+            self.used += size
+            return self.chunks[self.count - 1][start..<start + size]
+        if self.count == self.chunks.length:
+            let capacity: usize = 8 if self.chunks.length == 0 else self.chunks.length * 2
+            let grown = try new (u8[])[capacity] in memory.heap
+            for index in 0..<self.count:
+                grown[index] = self.chunks[index]
+            if self.chunks.length > 0:
+                free(self.chunks) in memory.heap
+            self.chunks = grown
+        let block = try new u8[size if size > chunk_size else chunk_size] in memory.heap
+        self.chunks[self.count] = block
+        self.count += 1
+        self.used = size
+        return block[0..<size]
+
+    ## A kept copy of `data`.
+    pub mutating func keep(data: const u8[]) -> const u8[]!:
+        let room = try self.reserve(data.length)
+        memory.copy(room, data, data.length)
+        return room
+
+    ## A kept copy of `text`.
+    pub mutating func keep_text(text: str) -> str!:
+        return (str)(try self.keep(text.bytes))
+
+    ## Give every chunk back; earlier views become invalid.
+    pub mutating func close():
+        for index in 0..<self.count:
+            free(self.chunks[index]) in memory.heap
+        if self.chunks.length > 0:
+            free(self.chunks) in memory.heap
+        var empty: u8[][]
+        self.chunks = empty
+        self.count = 0
+        self.used = 0

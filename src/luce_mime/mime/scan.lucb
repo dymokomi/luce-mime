@@ -1,0 +1,81 @@
+#==============================================================================================
+#
+#   mime/scan - Byte helpers shared by the parsers
+#
+#   DESCRIPTION:
+#       Header names compare without ASCII case; values are trimmed of RFC 5322 whitespace
+#       (space, tab, CR, LF). Nothing here allocates.
+#
+#==============================================================================================
+
+## The ASCII lower case of `byte`; other bytes are unchanged.
+pub func lower(byte: u8) -> u8:
+    if byte >= 'A' and byte <= 'Z':
+        return byte + 32
+    return byte
+
+## Whether `a` and `b` are the same text ignoring ASCII case.
+pub func same(a: const u8[], b: const u8[]) -> bool:
+    if a.length != b.length:
+        return false
+    for index in 0..<a.length:
+        if lower(a[index]) != lower(b[index]):
+            return false
+    return true
+
+## Whether `text` begins with `prefix`, ignoring ASCII case.
+pub func starts(text: const u8[], prefix: const u8[]) -> bool:
+    return text.length >= prefix.length and same(text[0..<prefix.length], prefix)
+
+## Whether `byte` is RFC 5322 folding whitespace.
+pub func is_space(byte: u8) -> bool:
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n'
+
+## `data` without leading and trailing whitespace.
+pub func trim(data: const u8[]) -> const u8[]:
+    var start: usize = 0
+    var end = data.length
+    while start < end and is_space(data[start]):
+        start += 1
+    while end > start and is_space(data[end - 1]):
+        end -= 1
+    return data[start..<end]
+
+## The value of hexadecimal digit `byte`, or none.
+pub func hex_value(byte: u8) -> u8?:
+    if byte >= '0' and byte <= '9':
+        return byte - '0'
+    if byte >= 'a' and byte <= 'f':
+        return byte - 'a' + 10
+    if byte >= 'A' and byte <= 'F':
+        return byte - 'A' + 10
+    return none
+
+## The upper-case hexadecimal digit for `value` below sixteen.
+pub func hex_digit(value: u8) -> u8:
+    return "0123456789ABCDEF".bytes[value]
+
+## The offset of the first `byte` in `data` at or after `start`, or none.
+pub func index_of(data: const u8[], byte: u8, start: usize = 0) -> usize?:
+    var index = start
+    while index < data.length:
+        if data[index] == byte:
+            return index
+        index += 1
+    return none
+
+## Whether `data` is all 7-bit ASCII.
+pub func is_ascii(data: const u8[]) -> bool:
+    for byte in data:
+        if byte >= 0x80:
+            return false
+    return true
+
+## Whether `a` and `b` hold the same bytes.
+pub func equal(a: const u8[], b: const u8[]) -> bool:
+    if a.length != b.length:
+        return false
+    for index in 0..<a.length:
+        if a[index] != b[index]:
+            return false
+    return true

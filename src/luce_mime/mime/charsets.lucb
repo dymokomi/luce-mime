@@ -1,0 +1,117 @@
+#==============================================================================================
+#
+#   mime/charsets - Bytes in a named charset, as UTF-8
+#
+#   DESCRIPTION:
+#       Mail names its charset per part and per encoded word. Built in are the ones that
+#       carry nearly all of it: UTF-8, US-ASCII, ISO-8859-1, ISO-8859-15 and Windows-1252
+#       (ISO-8859-1 and US-ASCII decode as Windows-1252, as WHATWG has browsers do, since
+#       senders mislabel it). An application adds the rest (Shift_JIS, GBK, KOI8-R, …) by
+#       installing a `CharsetDecoder`, for example one over luce-browser-foundation's
+#       text_codec. A charset nobody knows decodes as UTF-8 when the bytes are valid UTF-8,
+#       and as Windows-1252 otherwise. Invalid UTF-8 becomes U+FFFD; nothing fails.
+#
+#==============================================================================================
+
+## Decodes `data` in `charset` (lower case, trimmed) onto the output as UTF-8, answering
+## whether it knew the charset.
+pub type CharsetDecoder = func(str, const u8[], Bytes*) -> bool!
+
+## The decoder for charsets this package does not know; none until an application sets one.
+var extra_decoder: CharsetDecoder?
+
+## Install `decoder` for the charsets the built-in ones do not cover. Set it once, before
+## messages are decoded on any thread.
+pub func set_charset_decoder(decoder: CharsetDecoder?):
+    extra_decoder = decoder
+
+## The charsets decoded here.
+enum Builtin:
+    utf8
+    windows1252
+    latin9
+
+## Unicode for Windows-1252's 0x80-0x9F; the five undefined bytes keep their C1 value.
+let windows1252_high: u16[32] = [
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+]
+
+## The built-in decoder named by `name`, or none.
+func builtin(name: const u8[]) -> Builtin?:
+    for alias in ["utf-8", "utf8", "unicode-1-1-utf-8"]:
+        if same(name, alias.bytes):
+            return Builtin.utf8
+    for alias in ["windows-1252", "cp1252", "x-cp1252", "iso-8859-1", "iso8859-1", "iso_8859-1",
+                  "latin1", "latin-1", "l1", "cp819", "us-ascii", "ascii", "ansi_x3.4-1968", "us"]:
+        if same(name, alias.bytes):
+            return Builtin.windows1252
+    for alias in ["iso-8859-15", "iso8859-15", "iso_8859-15", "latin-9", "latin9", "l9"]:
+        if same(name, alias.bytes):
+            return Builtin.latin9
+    return none
+
+## The Unicode scalar of byte `byte` in ISO-8859-15.
+func latin9_scalar(byte: u8) -> u32:
+    return match byte:
+        0xA4 => 0x20AC
+        0xA6 => 0x0160
+        0xA8 => 0x0161
+        0xB4 => 0x017D
+        0xB8 => 0x017E
+        0xBC => 0x0152
+        0xBD => 0x0153
+        0xBE => 0x0178
+        _ => byte
+
+## Append `data`, taken as UTF-8, with each invalid sequence as U+FFFD.
+pub func put_utf8(data: const u8[], out: Bytes*) -> !:
+    var index: usize = 0
+    while index < data.length:
+        if data[index] < 0x80:
+            try out.byte(data[index])
+            index += 1
+            continue
+        if let decoded = utf8.decode(data, index):
+            try out.put(data[index..<index + decoded.width])
+            index += decoded.width
+        else:
+            try out.put(b"\xEF\xBF\xBD")
+            index += 1
+
+## Append `data`, taken as Windows-1252, or as ISO-8859-15 with `latin9`.
+func put_single_byte(data: const u8[], out: Bytes*, latin9: bool) -> !:
+    for byte in data:
+        if byte < 0x80:
+            try out.byte(byte)
+        elif latin9:
+            try out.scalar(latin9_scalar(byte))
+        elif byte < 0xA0:
+            try out.scalar(windows1252_high[byte - 0x80])
+        else:
+            try out.scalar(byte)
+
+## Append `data`, in the charset called `charset`, as UTF-8.
+pub func decode_charset(charset: const u8[], data: const u8[], out: Bytes*) -> !:
+    let name = trim(charset)
+    if let known = builtin(name):
+        match known:
+            .utf8: try put_utf8(data, out)
+            .windows1252: try put_single_byte(data, out, false)
+            .latin9: try put_single_byte(data, out, true)
+        return
+    # ISO-2022-JP and UTF-7 are 7-bit, so even ASCII bytes go to the decoder first.
+    if let decoder = extra_decoder:
+        var lowered: u8[64]
+        if name.length <= lowered.length and is_ascii(name):
+            for index in 0..<name.length:
+                lowered[index] = lower(name[index])
+            if try decoder((str)lowered[0..<name.length], data, out):
+                return
+    if utf8.valid(data):
+        try out.put(data)
+    else:
+        try put_single_byte(data, out, false)
+

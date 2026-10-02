@@ -1,0 +1,242 @@
+#==============================================================================================
+#
+#   mime/params - Structured values: type/subtype and parameters
+#
+#   DESCRIPTION:
+#       Content-Type and Content-Disposition are a leading value and `; name=value`
+#       parameters (RFC 2045 §5.1), with comments allowed anywhere (RFC 5322 CFWS). A
+#       parameter may be split into numbered pieces and carry its own charset (RFC 2231):
+#       `title*0*=us-ascii'en'This%20is; title*1=" even more"`. Values that were written,
+#       against the rules, as RFC 2047 encoded words inside quotes (as Outlook writes
+#       file names) are decoded too.
+#
+#==============================================================================================
+
+## The most pieces one RFC 2231 parameter may be split into.
+let maximum_pieces: usize = 64
+
+## Whether `byte` ends an RFC 2045 token.
+func is_special(byte: u8) -> bool:
+    return byte <= 32 or byte == 127 or index_of("()<>@,;:\\\"/[]?=".bytes, byte) != none
+
+## A structured value read piece by piece, with comments and whitespace skipped.
+struct Tokens:
+    var data: const u8[]
+    var index: usize
+
+    ## Skip whitespace and comments, which may nest and hold quoted pairs.
+    mutating func skip():
+        while self.index < self.data.length:
+            let byte = self.data[self.index]
+            if is_space(byte):
+                self.index += 1
+            elif byte == '(':
+                var depth: usize = 0
+                while self.index < self.data.length:
+                    let inner = self.data[self.index]
+                    if inner == '\\':
+                        self.index += 1
+                    elif inner == '(':
+                        depth += 1
+                    elif inner == ')':
+                        depth -= 1
+                        if depth == 0:
+                            self.index += 1
+                            break
+                    self.index += 1
+            else:
+                return
+
+    ## The next byte after skipping, without taking it.
+    mutating func peek() -> u8?:
+        self.skip()
+        if self.index < self.data.length:
+            return self.data[self.index]
+        return none
+
+    ## Take `byte` when it is next.
+    mutating func take(byte: u8) -> bool:
+        if let next = self.peek():
+            if next == byte:
+                self.index += 1
+                return true
+        return false
+
+    ## The token that starts here; empty when none does.
+    mutating func token() -> const u8[]:
+        self.skip()
+        let start = self.index
+        while self.index < self.data.length and not is_special(self.data[self.index]):
+            self.index += 1
+        return self.data[start..<self.index]
+
+    ## A value: a quoted string, unescaped onto `out`, or a token. Whether it was quoted.
+    mutating func value(out: Bytes*) -> bool!:
+        self.skip()
+        if self.index < self.data.length and self.data[self.index] == '"':
+            self.index += 1
+            while self.index < self.data.length:
+                var byte = self.data[self.index]
+                if byte == '"':
+                    self.index += 1
+                    break
+                if byte == '\\' and self.index + 1 < self.data.length:
+                    self.index += 1
+                    byte = self.data[self.index]
+                if byte != '\r' and byte != '\n':
+                    try out.byte(byte)
+                self.index += 1
+            return true
+        # A lenient token: senders leave `/`, `?`, `=` and `@` unquoted in values.
+        let start = self.index
+        while self.index < self.data.length:
+            let byte = self.data[self.index]
+            if byte == ';' or is_space(byte) or byte == '"':
+                break
+            self.index += 1
+        try out.put(self.data[start..<self.index])
+        return false
+
+    ## Skip to just past the next `;` that is outside quotes and comments.
+    mutating func next_parameter():
+        while self.index < self.data.length:
+            let byte = self.data[self.index]
+            if byte == '"':
+                self.index += 1
+                while self.index < self.data.length:
+                    let inner = self.data[self.index]
+                    self.index += 2 if inner == '\\' else 1
+                    if inner == '"':
+                        break
+                continue
+            if byte == '(':
+                self.skip()
+                continue
+            self.index += 1
+            if byte == ';':
+                return
+
+## The type and subtype of a Content-Type value, as views; empty when it has none.
+pub func media_type(value: const u8[]) -> (const u8[], const u8[]):
+    var tokens = Tokens(data = value, index = 0)
+    let kind = tokens.token()
+    if kind.length == 0 or not tokens.take('/'):
+        var empty: const u8[]
+        return (empty, empty)
+    return (kind, tokens.token())
+
+## The leading token of a structured value, such as `attachment` in Content-Disposition.
+pub func leading_token(value: const u8[]) -> const u8[]:
+    var tokens = Tokens(data = value, index = 0)
+    return tokens.token()
+
+## One piece of an RFC 2231 parameter, its value held in a shared buffer.
+struct Piece:
+    var number: u32
+    var extended: bool
+    var start: usize
+    var end: usize
+
+## Append `data`'s %XX escapes decoded.
+func percent_decode(data: const u8[], out: Bytes*) -> !:
+    var index: usize = 0
+    while index < data.length:
+        if data[index] == '%' and index + 2 < data.length:
+            if let high = hex_value(data[index + 1]):
+                if let low = hex_value(data[index + 2]):
+                    try out.byte((high << 4) | low)
+                    index += 3
+                    continue
+        try out.byte(data[index])
+        index += 1
+
+## Append the value of parameter `name` of structured value `value` as UTF-8, answering
+## whether it was there. RFC 2231 pieces are put together and decoded; a plain value has
+## any encoded words in it decoded.
+pub func parameter(value: const u8[], name: str, out: Bytes*) -> bool!:
+    var tokens = Tokens(data = value, index = 0)
+    tokens.next_parameter()
+    var values: Bytes
+    defer values.close()
+    var pieces: Piece[64]
+    var count: usize = 0
+    var plain_start: usize = 0
+    var plain_end: usize = 0
+    var plain = false
+    while tokens.index < tokens.data.length:
+        let attribute = tokens.token()
+        if attribute.length == 0 or not tokens.take('='):
+            tokens.next_parameter()
+            continue
+        # `name`, `name*`, `name*N` or `name*N*`.
+        var base = attribute
+        var number: u32? = none
+        var extended = false
+        if let star = index_of(attribute, '*'):
+            base = attribute[0..<star]
+            var rest = attribute[star + 1..]
+            if rest.length > 0 and rest[rest.length - 1] == '*':
+                extended = true
+                rest = rest[0..<rest.length - 1]
+            elif rest.length == 0:
+                extended = true
+            if rest.length > 0:
+                var parsed: u32 = 0
+                for digit in rest:
+                    if digit < '0' or digit > '9' or parsed > 1000:
+                        parsed = 0xFFFFFFFF
+                        break
+                    parsed = parsed * 10 + (digit - '0')
+                number = parsed
+        let start = values.used
+        discard(try tokens.value(&values))
+        let end = values.used
+        tokens.next_parameter()
+        if not same(base, name.bytes):
+            continue
+        if let piece = number:
+            if count < maximum_pieces and piece < 0xFFFFFFFF:
+                pieces[count] = Piece(number = piece, extended = extended, start = start, end = end)
+                count += 1
+        elif extended:
+            pieces[0] = Piece(number = 0, extended = true, start = start, end = end)
+            count = 1
+            break
+        elif not plain:
+            plain = true
+            plain_start = start
+            plain_end = end
+    let held = values.view()
+    if count == 0:
+        if not plain:
+            return false
+        try decode_words(held[plain_start..<plain_end], out)
+        return true
+    # Pieces in their numbered order; an insertion sort, as there are few.
+    for index in 1..<count:
+        let piece = pieces[index]
+        var at = index
+        while at > 0 and pieces[at - 1].number > piece.number:
+            pieces[at] = pieces[at - 1]
+            at -= 1
+        pieces[at] = piece
+    # The first extended piece names the charset: `charset'language'text`.
+    var charset: const u8[]
+    var joined: Bytes
+    defer joined.close()
+    for index in 0..<count:
+        var text = held[pieces[index].start..<pieces[index].end]
+        if pieces[index].extended:
+            if index == 0:
+                if let first = index_of(text, '\''):
+                    if let second = index_of(text, '\'', first + 1):
+                        charset = text[0..<first]
+                        text = text[second + 1..]
+            try percent_decode(text, &joined)
+        else:
+            try joined.put(text)
+    if charset.length > 0:
+        try decode_charset(charset, joined.view(), out)
+    else:
+        try decode_words(joined.view(), out)
+    return true

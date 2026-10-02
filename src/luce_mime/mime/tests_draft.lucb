@@ -1,0 +1,78 @@
+#==============================================================================================
+#
+#   mime/tests_draft - Drafts written for SMTP and read back
+#
+#==============================================================================================
+
+test "a plain draft is 7-bit with CRLF lines and reads back":
+    var draft: Draft
+    defer draft.close()
+    try draft.set_from("Alice Ångström", "alice@example.test")
+    try draft.add_to("", "bob@example.test")
+    discard(try draft.add_recipients("cc", "Carol <carol@example.org>, \"Doe, John\" <john@example.test>"))
+    try draft.add_bcc("", "secret@example.test")
+    try draft.set_subject("Re: Café plans")
+    try draft.set_text("Hello Bob,\nsee you at the café.\n")
+    try draft.set_reply("earlier.7@example.test", "<start.1@example.test>")
+    draft.set_date(1790871300, -420)
+    try draft.set_message_id("fixed.1@example.test")
+    let text = try draft.encode()
+    assert(is_ascii(text.bytes))
+    assert(not strings.contains(text, "secret@"))
+    assert(strings.contains(text, "Date: Thu, 01 Oct 2026 09:15:00 -0700\r\n"))
+    assert(strings.contains(text, "Content-Transfer-Encoding: quoted-printable\r\n"))
+    assert(draft.recipient_count() == 4)
+    assert(try draft.recipient(3) == "secret@example.test")
+    assert(draft.sender() == "alice@example.test")
+    var message = try Message.read(text.bytes)
+    defer message.close()
+    assert(try message.address_line("From") == "Alice Ångström <alice@example.test>")
+    assert(try message.address_line("Cc") == "Carol <carol@example.org>, Doe, John <john@example.test>")
+    assert(try message.subject() == "Re: Café plans")
+    assert(try message.body_text() == "Hello Bob,\r\nsee you at the café.")
+    assert(try message.message_id() == "fixed.1@example.test")
+    assert(try message.in_reply_to() == "earlier.7@example.test")
+    assert(try message.references() == "<start.1@example.test> <earlier.7@example.test>")
+    # No line is longer than 78 characters.
+    var column: usize = 0
+    for byte in text.bytes:
+        if byte == '\n':
+            column = 0
+        else:
+            column += 1
+            assert(column <= 78)
+
+test "attachments go in multipart/mixed as base64 with their names":
+    var draft: Draft
+    defer draft.close()
+    try draft.set_from("", "alice@example.test")
+    try draft.add_to("Bob", "bob@example.test")
+    try draft.set_subject("Files")
+    try draft.set_text("Two files.")
+    try draft.attach("notes.txt", "", b"plain notes\n")
+    try draft.attach("résumé.pdf", "", b"%PDF-1.4\n\x00\xff")
+    let text = try draft.encode()
+    var message = try Message.read(text.bytes)
+    defer message.close()
+    assert(try message.part_type(0) == "multipart/mixed")
+    assert(try message.body_text() == "Two files.")
+    assert(try message.attachment_count() == 2)
+    let notes = try message.attachment(0)
+    assert(try message.part_filename(notes) == "notes.txt")
+    assert(try message.part_type(notes) == "text/plain")
+    assert((str)(try message.part_data(notes)) == "plain notes\n")
+    let pdf = try message.attachment(1)
+    assert(try message.part_filename(pdf) == "résumé.pdf")
+    assert(try message.part_type(pdf) == "application/pdf")
+    assert(equal(try message.part_data(pdf), b"%PDF-1.4\n\x00\xff"))
+
+test "a draft without sender or recipient is refused":
+    var draft: Draft
+    defer draft.close()
+    try draft.set_text("x")
+    let missing = draft.encode() catch failure:
+        assert(failure.code == incomplete)
+        recover ""
+    assert(missing == "")
+    let made = try draft.identity()
+    assert(strings.ends_with(made, "@luced-message.local"))

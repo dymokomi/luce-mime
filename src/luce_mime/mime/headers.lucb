@@ -1,0 +1,132 @@
+#==============================================================================================
+#
+#   mime/headers - A header block: its fields, unfolded, found by name
+#
+#   DESCRIPTION:
+#       A header block runs to the first empty line; what follows is the body. Each field
+#       is a name, a colon and a value that continues on lines starting with a space or a
+#       tab. Lines end in CRLF or a bare LF. A line that is neither a field nor a
+#       continuation (an mbox `From ` line, junk) is skipped. A Header keeps views into the
+#       message: names and values are raw, still folded; `unfold` and `decode_words` make a
+#       value text.
+#
+#==============================================================================================
+
+## One header field: views of its name and of its raw, folded value.
+pub struct Field:
+    pub var name: const u8[]
+    pub var value: const u8[]
+    ## Where the value starts in the parsed data, so a continuation can extend it.
+    var start: usize
+
+## The fields of one header block, in order, and where its body starts.
+pub struct Header:
+    var fields: Field[]
+    var count: usize
+    ## The offset in the parsed data where the body starts.
+    pub var body: usize
+
+    ## Read the header block at the start of `data`. Views point into `data`, which must
+    ## outlive the header.
+    pub static func read(data: const u8[]) -> Header!:
+        var header = Header(body = data.length)
+        errdefer header.close()
+        var index: usize = 0
+        while index < data.length:
+            let line_end = index_of(data, '\n', index) else data.length
+            var content_end = line_end
+            if content_end > index and data[content_end - 1] == '\r':
+                content_end -= 1
+            if content_end == index:
+                # The empty line: the body follows it.
+                header.body = line_end + 1 if line_end < data.length else data.length
+                return header
+            let line = data[index..<content_end]
+            if line[0] == ' ' or line[0] == '\t':
+                # A continuation of the previous field.
+                if header.count > 0:
+                    let start = header.fields[header.count - 1].start
+                    header.fields[header.count - 1].value = data[start..<content_end]
+            elif let colon = index_of(line, ':'):
+                let name = trim(line[0..<colon])
+                if name.length > 0 and index_of(name, ' ') == none:
+                    var value_start = index + colon + 1
+                    while value_start < content_end and (data[value_start] == ' ' or data[value_start] == '\t'):
+                        value_start += 1
+                    try header.add(Field(name = name, value = data[value_start..<content_end], start = value_start))
+            index = line_end + 1
+        header.body = data.length
+        return header
+
+    mutating func add(field: Field) -> !:
+        if self.count == maximum_fields:
+            return
+        if self.count == self.fields.length:
+            let capacity: usize = 32 if self.fields.length == 0 else self.fields.length * 2
+            let grown = try alloc Field[capacity] in memory.heap
+            for index in 0..<self.count:
+                grown[index] = self.fields[index]
+            if self.fields.length > 0:
+                free(self.fields) in memory.heap
+            self.fields = grown
+        self.fields[self.count] = field
+        self.count += 1
+
+    ## How many fields there are.
+    pub func length() -> usize:
+        return self.count
+
+    ## The field at `index`.
+    pub func at(index: usize) -> Field!:
+        if index >= self.count:
+            error(out_of_range, "no header field at that index")
+        return self.fields[index]
+
+    ## The raw value of the first field called `name`, or none.
+    pub func find(name: str) -> const u8[]?:
+        for index in 0..<self.count:
+            if same(self.fields[index].name, name.bytes):
+                return self.fields[index].value
+        return none
+
+    ## The raw value of the `nth` field called `name`, counting from zero, or none.
+    pub func find_nth(name: str, nth: usize) -> const u8[]?:
+        var seen: usize = 0
+        for index in 0..<self.count:
+            if same(self.fields[index].name, name.bytes):
+                if seen == nth:
+                    return self.fields[index].value
+                seen += 1
+        return none
+
+    ## Give the field table back. The views it held were into someone else's data.
+    pub mutating func close():
+        if self.fields.length > 0:
+            free(self.fields) in memory.heap
+        var empty: Field[]
+        self.fields = empty
+        self.count = 0
+
+## Append `value` unfolded: line breaks removed, each run of whitespace one space, and
+## the ends trimmed.
+pub func unfold(value: const u8[], out: Bytes*) -> !:
+    var space = false
+    var wrote = false
+    for byte in trim(value):
+        if byte == '\r' or byte == '\n':
+            continue
+        if byte == ' ' or byte == '\t':
+            space = true
+            continue
+        if space and wrote:
+            try out.byte(' ')
+        space = false
+        wrote = true
+        try out.byte(byte)
+
+## Append `value` as text: unfolded, encoded words decoded, as UTF-8.
+pub func header_text(value: const u8[], out: Bytes*) -> !:
+    var unfolded: Bytes
+    defer unfolded.close()
+    try unfold(value, &unfolded)
+    try decode_words(unfolded.view(), out)

@@ -1,0 +1,61 @@
+#==============================================================================================
+#
+#   mime - Internet messages: read them, show them, write them
+#
+#   DESCRIPTION:
+#       An RFC 5322 message is a block of header fields and a body; MIME (RFC 2045-2049)
+#       makes the body a tree of parts, each with its own type, charset and transfer
+#       encoding. `parse` reads a message into a `Message`: its header fields unfolded and
+#       decoded (RFC 2047 words, RFC 2231 parameters), its addresses and date, and its part
+#       tree, each part's content decoded to bytes or UTF-8 text on request. `body_text`
+#       gives the text a reader shows: the plain alternative, or the HTML one made into
+#       text. A `Draft` builds an outgoing message in 7-bit form for SMTP.
+#
+#       Everything a Message hands out is a view into storage it owns, valid until it
+#       closes; from Luce each text arrives as an owned copy.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb      imports, error codes, limits
+#       pool.lucb        TextPool: decoded text kept at stable addresses
+#       scan.lucb        byte helpers: ASCII case, whitespace, tokens
+#       codecs.lucb      base64 and quoted-printable, both ways
+#       charsets.lucb    bytes in a named charset to UTF-8
+#       words.lucb       RFC 2047 encoded words, decoded and written
+#       headers.lucb     a header block: fields, unfolding, lookup
+#       params.lucb      structured values: type/subtype; parameters (RFC 2231)
+#       addresses.lucb   RFC 5322 address lists
+#       dates.lucb       RFC 5322 dates, read and written
+#       parts.lucb       the MIME part tree
+#       html.lucb        HTML made into readable text
+#       message.lucb     Message: the parsed message and its accessors
+#       draft.lucb       Draft: an outgoing message written for SMTP
+#       tests*.lucb      tests over fixtures and hand-written messages
+#
+#==============================================================================================
+
+import c
+import files
+import interop
+import memory
+import strings
+import time
+import utf8
+
+## Input that is not a message, or a value that cannot be what it claims.
+pub let malformed: ErrorCode = ErrorCode.package(1)
+## A message, a part tree or a header block past what this package accepts.
+pub let limit_exceeded: ErrorCode = ErrorCode.package(2)
+## A part, field or address index past the end.
+pub let out_of_range: ErrorCode = ErrorCode.package(3)
+## A draft that cannot be written: no sender, no recipient, an unreadable attachment.
+pub let incomplete: ErrorCode = ErrorCode.package(4)
+
+## The largest message `parse` accepts.
+pub let maximum_message: usize = 512 * 1024 * 1024
+## The most parts in one message's tree; past it the rest of the body is one part.
+pub let maximum_parts: usize = 4096
+## How deeply multiparts may nest.
+pub let maximum_depth: usize = 32
+## The most header fields one header block keeps.
+pub let maximum_fields: usize = 4096

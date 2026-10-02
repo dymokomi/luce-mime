@@ -1,0 +1,60 @@
+#==============================================================================================
+#
+#   mime/tests_codecs - Base64 and quoted-printable round trips and forgiving decodes
+#
+#==============================================================================================
+
+## `data` decoded as base64.
+func base64_of(data: str, out: Bytes*) -> !:
+    out.clear()
+    try decode_base64(data.bytes, out)
+
+test "base64 decodes padded, unpadded and wrapped input":
+    var out: Bytes
+    defer out.close()
+    try base64_of("SGVsbG8sIHdvcmxkIQ==", &out)
+    assert((str)out.view() == "Hello, world!")
+    try base64_of("SGVsbG8sIHdvcmxkIQ", &out)
+    assert((str)out.view() == "Hello, world!")
+    try base64_of("SGVs\r\nbG8s IHdv\tcmxk\r\nIQ==", &out)
+    assert((str)out.view() == "Hello, world!")
+
+test "base64 encodes in 76-column CRLF lines and decodes back":
+    var data: u8[200]
+    for index in 0..<200:
+        data[index] = (u8)(index * 7)
+    var encoded: Bytes
+    defer encoded.close()
+    try encode_base64(data, &encoded)
+    let text = encoded.view()
+    assert(text[76] == '\r' and text[77] == '\n')
+    var decoded: Bytes
+    defer decoded.close()
+    try decode_base64(text, &decoded)
+    assert(equal(decoded.view(), data[0..<200]))
+
+test "quoted-printable decodes escapes and soft breaks and keeps a stray =":
+    var out: Bytes
+    defer out.close()
+    try decode_quoted(b"Caf=C3=A9 au=\r\n lait = 3=", &out)
+    assert((str)out.view() == "Café au lait = 3")
+    out.clear()
+    try decode_quoted(b"Caf=C3=A9_au_lait", &out, words = true)
+    assert((str)out.view() == "Café au lait")
+
+test "quoted-printable encoding breaks long lines and escapes trailing blanks":
+    var text: Bytes
+    defer text.close()
+    for index in 0..<100:
+        try text.byte('a')
+    try text.put(b" \r\nnext=line")
+    var encoded: Bytes
+    defer encoded.close()
+    try encode_quoted(text.view(), &encoded)
+    let lines = (str)encoded.view()
+    assert(strings.contains(lines, "=\r\n"))
+    assert(strings.contains(lines, "=20\r\nnext=3Dline"))
+    var decoded: Bytes
+    defer decoded.close()
+    try decode_quoted(encoded.view(), &decoded)
+    assert(equal(decoded.view(), text.view()))
