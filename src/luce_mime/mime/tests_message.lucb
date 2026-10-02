@@ -127,7 +127,8 @@ test "the body a reader shows and the list preview":
     var message = try Message.read(mixed_message.bytes)
     defer message.close()
     assert(try message.body_text() == "Hi Alice,\n\nThe plan is attached. Café at ten?\n> earlier quoted text")
-    assert(try message.preview() == "Hi Alice, The plan is attached. Café at ten?")
+    assert(try message.body_text(prefer_html = true) == "Hi Alice,\n\nThe plan is attached.")
+    assert(try message.preview() == "Hi Alice, The plan is attached.")
     assert(try message.preview(limit = 8) == "Hi Alice")
     assert(strings.starts_with(try message.body_html(), "<html>"))
 

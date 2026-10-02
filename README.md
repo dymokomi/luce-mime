@@ -70,7 +70,7 @@ stays valid until the message closes.
 | `part_filename(i)`, `part_charset(i)`, `part_content_id(i)`, `part_size(i)` | a part's metadata |
 | `part_text(i)`, `part_data(i)`, `save_part(i, path)` | a part's content, decoded |
 | `attachment_count()`, `attachment(n)`, `part_is_attachment(i)` | what a user would save |
-| `body_text()`, `body_html()`, `preview(limit)` | what a reader and a list show |
+| `body_text(prefer_html)`, `body_html()`, `preview(limit)` | what a reader and a list show; HTML alternatives as text with `prefer_html` |
 
 Charsets beyond the built-in ones: install a decoder once, for example one over
 luce-browser-foundation's `text_codec`:

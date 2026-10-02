@@ -300,27 +300,29 @@ pub struct Message:
 
     # mark: the body a reader shows ==============================================================
 
-    ## Append the text of part `index` and of what it holds, as a reader shows it.
-    mutating func gather(index: usize, html: bool, out: Bytes*) -> !:
+    ## Append the text of part `index` and of what it holds, as a reader shows it. Of
+    ## alternatives it takes the HTML one (made into text) with `prefer_html`, the plain
+    ## one otherwise, and whichever there is when only one kind is.
+    mutating func gather(index: usize, prefer_html: bool, out: Bytes*) -> !:
         let part = try self.parts.at(index)
         if part.is("multipart"):
             let children = self.children(index)
             if part.is("multipart", "alternative"):
-                # The plain alternative; the HTML one when asked or when there is no other.
                 var chosen: usize? = none
                 for child in children.0..<children.1:
                     let candidate = try self.parts.at(child)
                     if candidate.parent != (i64)index:
                         continue
-                    let wanted = candidate.is("text", "html") if html else candidate.is("text", "plain")
+                    let rich = candidate.is("text", "html") or candidate.is("multipart", "related")
+                    let wanted = rich if prefer_html else candidate.is("text", "plain")
                     if wanted or chosen == none:
                         chosen = child
                 if let child = chosen:
-                    try self.gather(child, html, out)
+                    try self.gather(child, prefer_html, out)
                 return
             for child in children.0..<children.1:
                 if (try self.parts.at(child)).parent == (i64)index:
-                    try self.gather(child, html, out)
+                    try self.gather(child, prefer_html, out)
             return
         if same(disposition(part), b"attachment"):
             return
@@ -333,7 +335,7 @@ pub struct Message:
         var text: Bytes
         defer text.close()
         try decode_text(self.raw, part, &text)
-        if rich and not html:
+        if rich:
             try html_to_text(text.view(), out)
         else:
             try out.put(text.view())
@@ -346,11 +348,13 @@ pub struct Message:
             end += 1
         return (index + 1, end)
 
-    ## The text a reader shows for the body: plain text, or HTML made into text.
-    pub mutating func body_text() -> str!:
+    ## The text a reader shows for the body: the plain alternative, or with `prefer_html`
+    ## the HTML one made into text (as Mail shows HTML first); a message with only one
+    ## kind shows that one.
+    pub mutating func body_text(prefer_html: bool = false) -> str!:
         var text: Bytes
         defer text.close()
-        try self.gather(0, false, &text)
+        try self.gather(0, prefer_html, &text)
         return (str)(try self.pool.keep(trim(text.view())))
 
     ## The HTML body, when the message has one; empty text otherwise.
@@ -361,12 +365,13 @@ pub struct Message:
                 return try self.part_text(index)
         return ""
 
-    ## The opening of the body on one line, for a message list: quoted lines and
+    ## The opening of the body on one line, for a message list (from the HTML alternative
+    ## when there is one, as `body_text(prefer_html = true)` reads it): quoted lines and
     ## signatures skipped, whitespace collapsed, at most `limit` characters.
     pub mutating func preview(limit: usize = 200) -> str!:
         var body: Bytes
         defer body.close()
-        try self.gather(0, false, &body)
+        try self.gather(0, true, &body)
         var line: Bytes
         defer line.close()
         var characters: usize = 0
