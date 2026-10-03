@@ -34,7 +34,7 @@ From Luce, a parsed message is an object and each text it returns is an owned
 copy:
 
 ```luce
-import luce_mime.mime
+from luce_mime import mime
 
 let message = mime.open("message.eml")          # or mime.parse(bytes)
 print(message.subject())                          # "Quarterly plan — draft"
