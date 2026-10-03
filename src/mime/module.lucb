@@ -35,12 +35,12 @@
 #==============================================================================================
 
 import c
-import files
+import luce_std.files
 import interop
 import memory
 import strings
 import time
-import utf8
+import luce_std.utf8
 
 ## Input that is not a message, or a value that cannot be what it claims.
 pub let malformed: ErrorCode = ErrorCode.package(1)

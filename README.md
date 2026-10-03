@@ -34,7 +34,7 @@ From Luce, a parsed message is an object and each text it returns is an owned
 copy:
 
 ```luce
-import mime
+import luce_mime.mime
 
 let message = mime.open("message.eml")          # or mime.parse(bytes)
 print(message.subject())                          # "Quarterly plan — draft"
@@ -94,7 +94,7 @@ their text only, and remote content is never fetched.
 
 `tests/run.py --base PATH` uses another compiler. On macOS, also run the tests
 under Guard Malloc before pushing changes to error paths:
-`DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib luce-base test src/luce_mime/mime --native`.
+`DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib luce-base test src/mime --native`.
 
 ## License
 
