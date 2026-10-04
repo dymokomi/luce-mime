@@ -427,5 +427,5 @@ pub func open(path: str) -> interop.Reference[Message]!:
     let terminated = try strings.copy(path)
     defer strings.release(terminated)
     let data = try files.read((c.str)terminated)
-    defer free(data)
-    return try parse(data)
+    defer data.release()
+    return try parse(data.value)

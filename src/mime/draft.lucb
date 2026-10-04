@@ -137,11 +137,11 @@ pub struct Draft:
         let terminated = try strings.copy(path)
         defer strings.release(terminated)
         let data = try files.read((c.str)terminated)
-        defer free(data)
+        defer data.release()
         var name = path
         if let slash = strings.last(path, '/'):
             name = (str)path.bytes[slash + 1..]
-        try self.attach(name, kind, data)
+        try self.attach(name, kind, data.value)
 
     ## The envelope sender.
     pub func sender() -> str:
