@@ -9,7 +9,7 @@ test "a plain draft is 7-bit with CRLF lines and reads back":
     defer draft.close()
     try draft.set_from("Alice Ångström", "alice@example.test")
     try draft.add_to("", "bob@example.test")
-    discard(try draft.add_recipients("cc", "Carol <carol@example.org>, \"Doe, John\" <john@example.test>"))
+    _ = try draft.add_recipients("cc", "Carol <carol@example.org>, \"Doe, John\" <john@example.test>")
     try draft.add_bcc("", "secret@example.test")
     try draft.set_subject("Re: Café plans")
     try draft.set_text("Hello Bob,\nsee you at the café.\n")

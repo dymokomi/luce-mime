@@ -27,7 +27,7 @@ pub struct Message:
     var parts: PartList
 
     ## Parse a copy of `data`.
-    pub static func read(data: const u8[]) -> Message!:
+    pub func read(data: const u8[]) -> Message!:
         if data.length > maximum_message:
             error(limit_exceeded, "the message is larger than this package reads")
         let raw = try new u8[data.length] in memory.heap
@@ -37,7 +37,7 @@ pub struct Message:
         try read_entity(message.raw, 0, message.raw.length, -1, 0, false, &message.parts)
         return message
 
-    static func own(native: Message*) -> interop.Reference[Message]!:
+    func own(native: Message*) -> interop.Reference[Message]!:
         return try interop.Reference[Message].adopt(native, message_type)
 
     ## The message's bytes, as parsed.
@@ -55,12 +55,12 @@ pub struct Message:
     # mark: header fields ========================================================================
 
     ## The text of the first header field called `name`: unfolded, encoded words decoded.
-    pub mutating func header(name: str) -> str?!:
+    pub func header(name: str) -> str?!:
         let value = self.header_block().find(name) else return none
         return try self.text_of(value)
 
     ## The text of the first `name` field, or empty text when there is none.
-    pub mutating func field(name: str) -> str!:
+    pub func field(name: str) -> str!:
         return (try self.header(name)) else ""
 
     ## How many fields the top-level header has.
@@ -73,22 +73,22 @@ pub struct Message:
         return (str)field.name
 
     ## The text of field `index`.
-    pub mutating func field_value(index: usize) -> str!:
+    pub func field_value(index: usize) -> str!:
         let field = try self.header_block().at(index)
         return try self.text_of(field.value)
 
-    mutating func text_of(value: const u8[]) -> str!:
+    func text_of(value: const u8[]) -> str!:
         var text: Bytes
         defer text.close()
         try header_text(value, &text)
         return (str)(try self.pool.keep(text.view()))
 
     ## The subject, or empty text.
-    pub mutating func subject() -> str!:
+    pub func subject() -> str!:
         return try self.field("Subject")
 
     ## The first message ID in field `name`, without its angle brackets; empty when none.
-    mutating func message_id_in(name: str) -> str!:
+    func message_id_in(name: str) -> str!:
         let value = self.header_block().find(name) else return ""
         let trimmed = trim(value)
         if let first = index_of(trimmed, '<'):
@@ -97,15 +97,15 @@ pub struct Message:
         return (str)(try self.pool.keep(trimmed))
 
     ## The Message-ID, without angle brackets.
-    pub mutating func message_id() -> str!:
+    pub func message_id() -> str!:
         return try self.message_id_in("Message-ID")
 
     ## The In-Reply-To ID, without angle brackets.
-    pub mutating func in_reply_to() -> str!:
+    pub func in_reply_to() -> str!:
         return try self.message_id_in("In-Reply-To")
 
     ## The References field unfolded: message IDs with their brackets, space separated.
-    pub mutating func references() -> str!:
+    pub func references() -> str!:
         let value = self.header_block().find("References") else return ""
         var text: Bytes
         defer text.close()
@@ -133,7 +133,7 @@ pub struct Message:
 
     ## The addresses of every `name` field (From, To, Cc, …) in order. The caller closes
     ## the list; its text lives in the message.
-    pub mutating func addresses(name: str) -> AddressList!:
+    pub func addresses(name: str) -> AddressList!:
         var list: AddressList
         errdefer list.close()
         var nth: usize = 0
@@ -143,26 +143,26 @@ pub struct Message:
         return list
 
     ## How many addresses field `name` holds.
-    pub mutating func address_count(name: str) -> usize!:
+    pub func address_count(name: str) -> usize!:
         var list = try self.addresses(name)
         defer list.close()
         return list.length()
 
     ## The display name of address `index` of field `name`; empty when it has none.
-    pub mutating func address_name(name: str, index: usize) -> str!:
+    pub func address_name(name: str, index: usize) -> str!:
         var list = try self.addresses(name)
         defer list.close()
         return (try list.at(index)).name
 
     ## The mailbox (`local@domain`) of address `index` of field `name`.
-    pub mutating func address_mailbox(name: str, index: usize) -> str!:
+    pub func address_mailbox(name: str, index: usize) -> str!:
         var list = try self.addresses(name)
         defer list.close()
         return (try list.at(index)).mailbox
 
     ## Field `name`'s addresses as a reader shows them: `Name <mailbox>, …`, the name
     ## alone when `short`.
-    pub mutating func address_line(name: str, short: bool = false) -> str!:
+    pub func address_line(name: str, short: bool = false) -> str!:
         var list = try self.addresses(name)
         defer list.close()
         var line: Bytes
@@ -196,7 +196,7 @@ pub struct Message:
         return (try self.parts.at(index)).depth
 
     ## Part `index`'s media type in lower case, `text/plain`.
-    pub mutating func part_type(index: usize) -> str!:
+    pub func part_type(index: usize) -> str!:
         let part = try self.parts.at(index)
         var text: Bytes
         defer text.close()
@@ -208,19 +208,19 @@ pub struct Message:
         return (str)(try self.pool.keep(text.view()))
 
     ## Part `index`'s file name, or empty text.
-    pub mutating func part_filename(index: usize) -> str!:
+    pub func part_filename(index: usize) -> str!:
         let part = try self.parts.at(index)
         var name: Bytes
         defer name.close()
-        discard(try file_name(part, &name))
+        _ = try file_name(part, &name)
         return (str)(try self.pool.keep(name.view()))
 
     ## Part `index`'s charset parameter, or empty text.
-    pub mutating func part_charset(index: usize) -> str!:
+    pub func part_charset(index: usize) -> str!:
         return try self.part_parameter(index, "Content-Type", "charset")
 
     ## Part `index`'s Content-ID, without angle brackets.
-    pub mutating func part_content_id(index: usize) -> str!:
+    pub func part_content_id(index: usize) -> str!:
         let part = try self.parts.at(index)
         let value = part.header.find("Content-ID") else return ""
         var text = trim(value)
@@ -228,12 +228,12 @@ pub struct Message:
             text = text[1..<text.length - 1]
         return (str)(try self.pool.keep(text))
 
-    mutating func part_parameter(index: usize, field: str, name: str) -> str!:
+    func part_parameter(index: usize, field: str, name: str) -> str!:
         let part = try self.parts.at(index)
         var text: Bytes
         defer text.close()
         if let value = part.header.find(field):
-            discard(try parameter(value, name, &text))
+            _ = try parameter(value, name, &text)
         return (str)(try self.pool.keep(text.view()))
 
     ## Whether part `index` is an attachment: marked as one, or a leaf that is not text
@@ -255,7 +255,7 @@ pub struct Message:
         return part.body_end - part.body_start
 
     ## Part `index`'s content with its transfer encoding undone.
-    pub mutating func part_data(index: usize) -> const u8[]!:
+    pub func part_data(index: usize) -> const u8[]!:
         let part = try self.parts.at(index)
         var data: Bytes
         defer data.close()
@@ -263,7 +263,7 @@ pub struct Message:
         return try self.pool.keep(data.view())
 
     ## Part `index`'s content as UTF-8 text, converted from its charset.
-    pub mutating func part_text(index: usize) -> str!:
+    pub func part_text(index: usize) -> str!:
         let part = try self.parts.at(index)
         var text: Bytes
         defer text.close()
@@ -303,7 +303,7 @@ pub struct Message:
     ## Append the text of part `index` and of what it holds, as a reader shows it. Of
     ## alternatives it takes the HTML one (made into text) with `prefer_html`, the plain
     ## one otherwise, and whichever there is when only one kind is.
-    mutating func gather(index: usize, prefer_html: bool, out: Bytes*) -> !:
+    func gather(index: usize, prefer_html: bool, out: Bytes*) -> !:
         let part = try self.parts.at(index)
         if part.is("multipart"):
             let children = self.children(index)
@@ -351,14 +351,14 @@ pub struct Message:
     ## The text a reader shows for the body: the plain alternative, or with `prefer_html`
     ## the HTML one made into text (as Mail shows HTML first); a message with only one
     ## kind shows that one.
-    pub mutating func body_text(prefer_html: bool = false) -> str!:
+    pub func body_text(prefer_html: bool = false) -> str!:
         var text: Bytes
         defer text.close()
         try self.gather(0, prefer_html, &text)
         return (str)(try self.pool.keep(trim(text.view())))
 
     ## The HTML body, when the message has one; empty text otherwise.
-    pub mutating func body_html() -> str!:
+    pub func body_html() -> str!:
         for index in 0..<self.parts.length():
             let part = try self.parts.at(index)
             if part.is("text", "html") and not same(disposition(part), b"attachment"):
@@ -368,7 +368,7 @@ pub struct Message:
     ## The opening of the body on one line, for a message list (from the HTML alternative
     ## when there is one, as `body_text(prefer_html = true)` reads it): quoted lines and
     ## signatures skipped, whitespace collapsed, at most `limit` characters.
-    pub mutating func preview(limit: usize = 200) -> str!:
+    pub func preview(limit: usize = 200) -> str!:
         var body: Bytes
         defer body.close()
         try self.gather(0, true, &body)
@@ -404,7 +404,7 @@ pub struct Message:
         return (str)(try self.pool.keep(line.view()))
 
     ## Give everything back; every view handed out becomes invalid.
-    pub mutating func close():
+    pub func close():
         self.parts.close()
         self.pool.close()
         if self.raw.length > 0:

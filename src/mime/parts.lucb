@@ -47,10 +47,10 @@ pub struct PartList:
             error(out_of_range, "no part at that index")
         return &self.items[index]
 
-    mutating func add(part: Part) -> !:
+    func add(part: Part) -> !:
         if self.count == self.items.length:
             let capacity: usize = 8 if self.items.length == 0 else self.items.length * 2
-            let grown = try alloc Part[capacity] in memory.heap
+            let grown = try new Part[capacity] --- in memory.heap
             for index in 0..<self.count:
                 grown[index] = self.items[index]
             if self.items.length > 0:
@@ -60,7 +60,7 @@ pub struct PartList:
         self.count += 1
 
     ## Give every part's header and the list back.
-    pub mutating func close():
+    pub func close():
         for index in 0..<self.count:
             self.items[index].header.close()
         if self.items.length > 0:
@@ -108,7 +108,7 @@ pub func read_entity(data: const u8[], start: usize, end: usize, parent: i64, de
         var boundary: Bytes
         defer boundary.close()
         if let value = content_type:
-            discard(try parameter(value, "boundary", &boundary))
+            _ = try parameter(value, "boundary", &boundary)
         if boundary.used > 0 and boundary.used <= 200:
             try read_multipart(data, body_start, end, boundary.view(), (i64)index, depth + 1, same(subtype, b"digest"), parts)
         return
@@ -183,7 +183,7 @@ pub func decode_text(data: const u8[], part: const Part*, out: Bytes*) -> !:
     var charset: Bytes
     defer charset.close()
     if let value = part.header.find("Content-Type"):
-        discard(try parameter(value, "charset", &charset))
+        _ = try parameter(value, "charset", &charset)
     try decode_charset(charset.view(), decoded.view(), out)
 
 ## The disposition of `part` as written (`inline`, `attachment`), or empty.

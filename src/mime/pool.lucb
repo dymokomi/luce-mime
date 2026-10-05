@@ -20,7 +20,7 @@ pub struct Bytes:
     var used: usize
 
     ## Room for `extra` more bytes.
-    mutating func reserve(extra: usize) -> !:
+    func reserve(extra: usize) -> !:
         let needed = self.used +? extra else error(limit_exceeded, "the decoded text is too large")
         if needed <= self.data.length:
             return
@@ -34,24 +34,24 @@ pub struct Bytes:
         self.data = grown
 
     ## Append `data`.
-    pub mutating func put(data: const u8[]) -> !:
+    pub func put(data: const u8[]) -> !:
         try self.reserve(data.length)
         memory.copy(self.data[self.used..], data, data.length)
         self.used += data.length
 
     ## Append `text`.
-    pub mutating func text(text: str) -> !:
+    pub func text(text: str) -> !:
         try self.put(text.bytes)
 
     ## Append one byte.
-    pub mutating func byte(value: u8) -> !:
+    pub func byte(value: u8) -> !:
         if self.used == self.data.length:
             try self.reserve(1)
         self.data[self.used] = value
         self.used += 1
 
     ## Append the UTF-8 encoding of `scalar`; a value that is not a scalar becomes U+FFFD.
-    pub mutating func scalar(scalar: u32) -> !:
+    pub func scalar(scalar: u32) -> !:
         var buffer: u8[4]
         let count = utf8.encode(scalar, buffer) else 0
         if count == 0:
@@ -64,11 +64,11 @@ pub struct Bytes:
         return self.data[0..<self.used]
 
     ## Forget the contents, keeping the storage.
-    pub mutating func clear():
+    pub func clear():
         self.used = 0
 
     ## Give the storage back.
-    pub mutating func close():
+    pub func close():
         if self.data.length > 0:
             free(self.data) in memory.heap
         var empty: u8[]
@@ -83,7 +83,7 @@ pub struct TextPool:
     var used: usize
 
     ## Room for `size` bytes that will not move: a span of exactly that length.
-    mutating func reserve(size: usize) -> u8[]!:
+    func reserve(size: usize) -> u8[]!:
         if size == 0:
             var empty: u8[]
             return empty
@@ -106,17 +106,17 @@ pub struct TextPool:
         return block[0..<size]
 
     ## A kept copy of `data`.
-    pub mutating func keep(data: const u8[]) -> const u8[]!:
+    pub func keep(data: const u8[]) -> const u8[]!:
         let room = try self.reserve(data.length)
         memory.copy(room, data, data.length)
         return room
 
     ## A kept copy of `text`.
-    pub mutating func keep_text(text: str) -> str!:
+    pub func keep_text(text: str) -> str!:
         return (str)(try self.keep(text.bytes))
 
     ## Give every chunk back; earlier views become invalid.
-    pub mutating func close():
+    pub func close():
         for index in 0..<self.count:
             free(self.chunks[index]) in memory.heap
         if self.chunks.length > 0:

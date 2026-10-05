@@ -32,10 +32,10 @@ pub struct AddressList:
             error(out_of_range, "no address at that index")
         return self.items[index]
 
-    mutating func add(address: Address) -> !:
+    func add(address: Address) -> !:
         if self.count == self.items.length:
             let capacity: usize = 8 if self.items.length == 0 else self.items.length * 2
-            let grown = try alloc Address[capacity] in memory.heap
+            let grown = try new Address[capacity] --- in memory.heap
             for index in 0..<self.count:
                 grown[index] = self.items[index]
             if self.items.length > 0:
@@ -45,7 +45,7 @@ pub struct AddressList:
         self.count += 1
 
     ## Give the list back; the text stays in its pool.
-    pub mutating func close():
+    pub func close():
         if self.items.length > 0:
             free(self.items) in memory.heap
         var empty: Address[]
@@ -59,13 +59,13 @@ struct Pending:
     var comment: Bytes
     var has_angle: bool
 
-    mutating func clear():
+    func clear():
         self.phrase.clear()
         self.angle.clear()
         self.comment.clear()
         self.has_angle = false
 
-    mutating func close():
+    func close():
         self.phrase.close()
         self.angle.close()
         self.comment.close()

@@ -28,7 +28,7 @@ pub struct Header:
 
     ## Read the header block at the start of `data`. Views point into `data`, which must
     ## outlive the header.
-    pub static func read(data: const u8[]) -> Header!:
+    pub func read(data: const u8[]) -> Header!:
         var header = Header(body = data.length)
         errdefer header.close()
         var index: usize = 0
@@ -58,12 +58,12 @@ pub struct Header:
         header.body = data.length
         return header
 
-    mutating func add(field: Field) -> !:
+    func add(field: Field) -> !:
         if self.count == maximum_fields:
             return
         if self.count == self.fields.length:
             let capacity: usize = 32 if self.fields.length == 0 else self.fields.length * 2
-            let grown = try alloc Field[capacity] in memory.heap
+            let grown = try new Field[capacity] --- in memory.heap
             for index in 0..<self.count:
                 grown[index] = self.fields[index]
             if self.fields.length > 0:
@@ -100,7 +100,7 @@ pub struct Header:
         return none
 
     ## Give the field table back. The views it held were into someone else's data.
-    pub mutating func close():
+    pub func close():
         if self.fields.length > 0:
             free(self.fields) in memory.heap
         var empty: Field[]

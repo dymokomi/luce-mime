@@ -25,7 +25,7 @@ struct Tokens:
     var index: usize
 
     ## Skip whitespace and comments, which may nest and hold quoted pairs.
-    mutating func skip():
+    func skip():
         while self.index < self.data.length:
             let byte = self.data[self.index]
             if is_space(byte):
@@ -48,14 +48,14 @@ struct Tokens:
                 return
 
     ## The next byte after skipping, without taking it.
-    mutating func peek() -> u8?:
+    func peek() -> u8?:
         self.skip()
         if self.index < self.data.length:
             return self.data[self.index]
         return none
 
     ## Take `byte` when it is next.
-    mutating func take(byte: u8) -> bool:
+    func take(byte: u8) -> bool:
         if let next = self.peek():
             if next == byte:
                 self.index += 1
@@ -63,7 +63,7 @@ struct Tokens:
         return false
 
     ## The token that starts here; empty when none does.
-    mutating func token() -> const u8[]:
+    func token() -> const u8[]:
         self.skip()
         let start = self.index
         while self.index < self.data.length and not is_special(self.data[self.index]):
@@ -71,7 +71,7 @@ struct Tokens:
         return self.data[start..<self.index]
 
     ## A value: a quoted string, unescaped onto `out`, or a token. Whether it was quoted.
-    mutating func value(out: Bytes*) -> bool!:
+    func value(out: Bytes*) -> bool!:
         self.skip()
         if self.index < self.data.length and self.data[self.index] == '"':
             self.index += 1
@@ -98,7 +98,7 @@ struct Tokens:
         return false
 
     ## Skip to just past the next `;` that is outside quotes and comments.
-    mutating func next_parameter():
+    func next_parameter():
         while self.index < self.data.length:
             let byte = self.data[self.index]
             if byte == '"':
@@ -189,7 +189,7 @@ pub func parameter(value: const u8[], name: str, out: Bytes*) -> bool!:
                     parsed = parsed * 10 + (digit - '0')
                 number = parsed
         let start = values.used
-        discard(try tokens.value(&values))
+        _ = try tokens.value(&values)
         let end = values.used
         tokens.next_parameter()
         if not same(base, name.bytes):

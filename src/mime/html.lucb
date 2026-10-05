@@ -100,14 +100,14 @@ struct TextWriter:
     var pre_depth: u32
 
     ## Begin a line: the quote prefix.
-    mutating func begin_line() -> !:
+    func begin_line() -> !:
         var level: u32 = 0
         while level < self.quote_depth:
             try self.out.put(b"> ")
             level += 1
 
     ## Write visible text, collapsing whitespace outside <pre>.
-    mutating func text(data: const u8[]) -> !:
+    func text(data: const u8[]) -> !:
         for byte in data:
             if self.pre_depth > 0 and byte == '\n':
                 try self.out.byte('\n')
@@ -127,7 +127,7 @@ struct TextWriter:
             try self.out.byte(byte)
 
     ## Write one scalar as visible text.
-    mutating func scalar(scalar: u32) -> !:
+    func scalar(scalar: u32) -> !:
         if scalar == 0xA0:
             try self.text(b"\xC2\xA0")
             return
@@ -139,14 +139,14 @@ struct TextWriter:
             try self.text(buffer[0..<count])
 
     ## A line break, as <br> makes: two in a row leave a blank line, more add nothing.
-    mutating func line_break() -> !:
+    func line_break() -> !:
         self.space = false
         if self.started and self.breaks < 2:
             try self.out.byte('\n')
             self.breaks += 1
 
     ## End the line, then leave `count` line breaks in all (a blank line for two).
-    mutating func breaks_to(count: u32) -> !:
+    func breaks_to(count: u32) -> !:
         self.space = false
         if not self.started:
             return
@@ -218,7 +218,7 @@ struct HtmlReader:
     var in_ordered: bool
 
     ## Act on `tag` from `data`; where reading continues.
-    mutating func tag(data: const u8[], tag: Tag) -> usize!:
+    func tag(data: const u8[], tag: Tag) -> usize!:
         let name = tag.name
         if not tag.closing and is_one_of(name, hidden_elements):
             # Skip to the matching close tag.

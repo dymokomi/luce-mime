@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-mime" {
     str owner = "dymokomi"
-    str version = "0.2.2"
+    str version = "0.3.0"
     str kind = "package"
     str language = "luce-base"
     str description = "Internet messages in luce-base: RFC 5322 headers, addresses and dates, RFC 2047 encoded words, the MIME part tree, base64 and quoted-printable, charsets decoded to UTF-8, a readable text view of a body, and outgoing messages built for SMTP."
@@ -10,7 +10,7 @@ def package "luce-mime" {
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.3.1"
+        str version = "^0.4.0"
         str path = "../luce-std"
     }
 }
