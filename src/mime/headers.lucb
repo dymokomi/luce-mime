@@ -28,7 +28,7 @@ pub struct Header:
 
     ## Read the header block at the start of `data`. Views point into `data`, which must
     ## outlive the header.
-    pub func read(data: const u8[]) -> Header!:
+    pub static func read(data: const u8[]) -> Header!:
         var header = Header(body = data.length)
         errdefer header.close()
         var index: usize = 0

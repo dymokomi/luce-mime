@@ -27,7 +27,7 @@ pub struct Message:
     var parts: PartList
 
     ## Parse a copy of `data`.
-    pub func read(data: const u8[]) -> Message!:
+    pub static func read(data: const u8[]) -> Message!:
         if data.length > maximum_message:
             error(limit_exceeded, "the message is larger than this package reads")
         let raw = try new u8[data.length] in memory.heap
@@ -37,7 +37,7 @@ pub struct Message:
         try read_entity(message.raw, 0, message.raw.length, -1, 0, false, &message.parts)
         return message
 
-    func own(native: Message*) -> interop.Reference[Message]!:
+    static func own(native: Message*) -> interop.Reference[Message]!:
         return try interop.Reference[Message].adopt(native, message_type)
 
     ## The message's bytes, as parsed.
