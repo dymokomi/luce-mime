@@ -26,7 +26,7 @@ parts, and an unknown charset is read as UTF-8 or Windows-1252.
 ```prisma
 def dependency "luce-mime" {
     str owner = "dymokomi"
-    str version = "^0.1.0"
+    str version = "^0.5.0"
 }
 ```
 
