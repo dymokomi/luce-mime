@@ -172,4 +172,4 @@ test "a multipart with no closing delimiter keeps its parts":
     assert(message.part_count() == 3)
     assert(try message.part_text(1) == "first")
     assert(try message.part_is_attachment(2))
-    assert(equal(try message.part_data(2), b"\x89PNG\r\n"))
+    assert((try message.part_data(2)) == b"\x89PNG\r\n")

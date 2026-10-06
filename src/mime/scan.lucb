@@ -70,12 +70,3 @@ pub func is_ascii(data: const u8[]) -> bool:
         if byte >= 0x80:
             return false
     return true
-
-## Whether `a` and `b` hold the same bytes.
-pub func equal(a: const u8[], b: const u8[]) -> bool:
-    if a.length != b.length:
-        return false
-    for index in 0..<a.length:
-        if a[index] != b[index]:
-            return false
-    return true

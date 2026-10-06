@@ -64,7 +64,7 @@ test "attachments go in multipart/mixed as base64 with their names":
     let pdf = try message.attachment(1)
     assert(try message.part_filename(pdf) == "résumé.pdf")
     assert(try message.part_type(pdf) == "application/pdf")
-    assert(equal(try message.part_data(pdf), b"%PDF-1.4\n\x00\xff"))
+    assert((try message.part_data(pdf)) == b"%PDF-1.4\n\x00\xff")
 
 test "a draft without sender or recipient is refused":
     var draft: Draft

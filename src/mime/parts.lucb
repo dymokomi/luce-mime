@@ -132,7 +132,7 @@ func read_multipart(data: const u8[], start: usize, end: usize, boundary: const 
         let content = data[line..<content_end]
         var delimiter = false
         var closing = false
-        if content.length >= boundary.length + 2 and content[0] == '-' and content[1] == '-' and equal(content[2..<2 + boundary.length], boundary):
+        if content.length >= boundary.length + 2 and content[0] == '-' and content[1] == '-' and content[2..<2 + boundary.length] == boundary:
             var rest = content[2 + boundary.length..]
             if rest.length >= 2 and rest[0] == '-' and rest[1] == '-':
                 closing = true

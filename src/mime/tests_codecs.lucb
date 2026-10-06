@@ -31,7 +31,7 @@ test "base64 encodes in 76-column CRLF lines and decodes back":
     var decoded: Bytes
     defer decoded.close()
     try decode_base64(text, &decoded)
-    assert(equal(decoded.view(), data[0..<200]))
+    assert(decoded.view() == data[0..<200])
 
 test "quoted-printable decodes escapes and soft breaks and keeps a stray =":
     var out: Bytes
@@ -57,4 +57,4 @@ test "quoted-printable encoding breaks long lines and escapes trailing blanks":
     var decoded: Bytes
     defer decoded.close()
     try decode_quoted(encoded.view(), &decoded)
-    assert(equal(decoded.view(), text.view()))
+    assert(decoded.view() == text.view())

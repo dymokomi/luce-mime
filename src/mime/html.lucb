@@ -75,10 +75,10 @@ func reference_scalar(name: const u8[]) -> u32?:
             return windows1252_high[value - 0x80]
         return value
     for entry in named_references:
-        if equal(name, entry.0.bytes):
+        if name == entry.0.bytes:
             return entry.1
     for at in 0..<latin1_names.length:
-        if equal(name, latin1_names[at].bytes):
+        if name == latin1_names[at].bytes:
             return 0xA0 + (u32)at
     return none
 
