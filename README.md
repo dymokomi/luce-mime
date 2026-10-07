@@ -89,10 +89,10 @@ their text only, and remote content is never fetched.
 ## Test
 
 ```sh
-./test.sh        # every test, native and through the C backend
+luc test         # every test
 ```
 
-`tests/run.py --base PATH` uses another compiler. On macOS, also run the tests
+`LUCE_BASE=PATH luc test` uses another compiler. On macOS, also run the tests
 under Guard Malloc before pushing changes to error paths:
 `DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib luce-base test src/mime --native`.
 
